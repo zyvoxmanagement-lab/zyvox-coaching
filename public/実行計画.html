@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Execution Plan</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#060912;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;padding:0 0 60px}
+
+  header{background:rgba(6,9,18,0.95);border-bottom:1px solid rgba(212,160,23,0.2);backdrop-filter:blur(12px);position:sticky;top:0;z-index:100;padding:14px 20px;display:flex;align-items:center;justify-content:space-between}
+  .logo{font-size:18px;font-weight:800;letter-spacing:.15em;background:linear-gradient(135deg,#c9a84c,#f0d080,#c9a84c);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .header-sub{font-size:11px;color:#64748b;margin-top:2px}
+
+  .container{max-width:900px;margin:0 auto;padding:24px 16px}
+
+  h1{font-size:26px;font-weight:800;color:#fff;margin-bottom:6px}
+  .desc{font-size:13px;color:#64748b;margin-bottom:24px;line-height:1.6}
+
+  /* Table */
+  .table-wrap{background:rgba(15,23,42,0.8);border:1px solid rgba(212,160,23,0.15);border-radius:14px;overflow:hidden}
+  .table-head{display:grid;grid-template-columns:130px 1fr 170px 36px;gap:0;background:rgba(6,9,18,0.6);border-bottom:1px solid rgba(212,160,23,0.1);padding:10px 12px;font-size:11px;color:#475569;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+
+  /* Row */
+  .row-wrap{border-bottom:1px solid rgba(30,41,59,0.5)}
+  .row-wrap:last-child{border-bottom:none}
+  .row{display:grid;grid-template-columns:130px 1fr 170px 36px;gap:0;align-items:center;min-height:40px;padding:6px 12px;transition:background .15s}
+  .row:hover{background:rgba(212,160,23,0.04)}
+
+  .children{border-left:2px solid rgba(212,160,23,0.1);margin-left:18px}
+  .children .row{grid-template-columns:130px 1fr 170px 36px}
+
+  /* Status */
+  .status-btn{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:20px;font-size:11px;font-weight:600;cursor:pointer;border:none;white-space:nowrap;position:relative}
+  .status-btn.inprogress{background:rgba(59,130,246,0.15);color:#60a5fa}
+  .status-btn.done{background:rgba(16,185,129,0.15);color:#34d399}
+  .status-btn.notstarted{background:rgba(100,116,139,0.15);color:#94a3b8}
+  .status-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+  .inprogress .status-dot{background:#60a5fa}
+  .done .status-dot{background:#34d399}
+  .notstarted .status-dot{background:#94a3b8}
+
+  .status-menu{position:absolute;top:calc(100% + 4px);left:0;background:#0f172a;border:1px solid rgba(212,160,23,0.2);border-radius:10px;padding:4px;z-index:200;min-width:120px;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+  .status-opt{display:flex;align-items:center;gap:6px;padding:7px 10px;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;transition:background .1s}
+  .status-opt:hover{background:rgba(212,160,23,0.08)}
+  .status-opt .dot{width:7px;height:7px;border-radius:50%}
+  .opt-inprogress .dot{background:#60a5fa} .opt-inprogress{color:#60a5fa}
+  .opt-done .dot{background:#34d399} .opt-done{color:#34d399}
+  .opt-notstarted .dot{background:#94a3b8} .opt-notstarted{color:#94a3b8}
+
+  /* Name */
+  .row-name{display:flex;align-items:center;gap:6px;min-width:0}
+  .toggle-btn{width:18px;height:18px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:#475569;font-size:10px;flex-shrink:0;transition:transform .2s,color .15s;border:none;background:transparent;border-radius:4px}
+  .toggle-btn:hover{color:#94a3b8;background:rgba(255,255,255,.05)}
+  .toggle-btn.open{transform:rotate(90deg)}
+  .toggle-spacer{width:18px;flex-shrink:0}
+  .name-input{background:transparent;border:none;outline:none;color:#e2e8f0;font-size:13px;width:100%;min-width:0;padding:2px 4px;border-radius:4px;transition:background .15s}
+  .name-input:focus{background:rgba(212,160,23,0.06);color:#fff}
+  .name-input.done-text{text-decoration:line-through;color:#475569}
+
+  /* Date */
+  .date-cell{display:flex;align-items:center;gap:4px}
+  .date-input{background:transparent;border:none;outline:none;color:#64748b;font-size:11px;padding:2px 4px;border-radius:4px;width:70px;transition:background .15s;cursor:pointer}
+  .date-input:focus{background:rgba(212,160,23,0.06);color:#e2e8f0}
+  .date-sep{color:#334155;font-size:10px}
+
+  /* Actions */
+  .row-actions{display:flex;gap:2px;align-items:center;justify-content:flex-end}
+  .icon-btn{width:26px;height:26px;display:flex;align-items:center;justify-content:center;border:none;background:transparent;cursor:pointer;color:#334155;border-radius:6px;font-size:13px;transition:all .15s;flex-shrink:0}
+  .icon-btn:hover{background:rgba(255,255,255,.07);color:#94a3b8}
+  .icon-btn.del:hover{color:#f87171;background:rgba(248,113,113,.08)}
+
+  /* Add buttons */
+  .add-sub-row{display:flex;align-items:center;gap:6px;padding:6px 12px 6px 30px;cursor:pointer;font-size:11px;color:#334155;transition:color .15s}
+  .add-sub-row:hover{color:#64748b}
+  .add-project-btn{display:flex;align-items:center;gap:6px;padding:10px 16px;cursor:pointer;font-size:12px;color:#475569;transition:color .15s;border-top:1px solid rgba(30,41,59,.5)}
+  .add-project-btn:hover{color:#94a3b8}
+
+  /* Depth indent */
+  .depth-1{margin-left:20px}
+  .depth-2{margin-left:40px}
+  .depth-3{margin-left:60px}
+
+  /* Empty */
+  .empty{padding:40px;text-align:center;color:#334155;font-size:13px}
+
+  /* Modal-less inline add form */
+  .inline-add{display:grid;grid-template-columns:130px 1fr 170px 36px;gap:0;align-items:center;padding:6px 12px;background:rgba(212,160,23,0.04);border-bottom:1px solid rgba(212,160,23,0.1)}
+  .inline-add input{background:rgba(6,9,18,0.8);border:1px solid rgba(212,160,23,0.2);color:#e2e8f0;padding:5px 8px;border-radius:7px;font-size:13px;outline:none;width:100%}
+  .inline-add input:focus{border-color:rgba(212,160,23,0.5)}
+  .inline-add .add-confirm{padding:5px 12px;background:linear-gradient(135deg,#b8860b,#d4a017);color:#000;border:none;border-radius:7px;font-size:12px;font-weight:700;cursor:pointer}
+  .inline-add .add-cancel{padding:5px 10px;background:transparent;color:#64748b;border:1px solid #334155;border-radius:7px;font-size:12px;cursor:pointer;margin-left:4px}
+
+  @media(max-width:640px){
+    .table-head{grid-template-columns:110px 1fr 0 30px}
+    .table-head .col-date{display:none}
+    .row{grid-template-columns:110px 1fr 0 30px}
+    .date-cell{display:none}
+    .inline-add{grid-template-columns:110px 1fr 0 30px}
+    .inline-add .date-cell{display:none}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="logo">ZYVOX</div>
+    <div class="header-sub">Execution Plan</div>
+  </div>
+  <div style="font-size:11px;color:#475569" id="save-indicator"></div>
+</header>
+
+<div class="container">
+  <h1>📋 Execution Plan</h1>
+  <p class="desc">プロジェクトのトグルを開くとサブタスクが表示されます。ステータス・名前・期限はすべてクリックで編集できます。</p>
+
+  <div class="table-wrap">
+    <div class="table-head">
+      <div>ステータス</div>
+      <div>プロジェクト</div>
+      <div class="col-date">期限</div>
+      <div></div>
+    </div>
+    <div id="root-list"></div>
+    <div class="add-project-btn" onclick="startInlineAdd(null)">＋ 新規プロジェクト</div>
+  </div>
+</div>
+
+<script>
+// ─── Data Model ───────────────────────────────
+// node: { id, name, status, dateStart, dateEnd, open, children: [node] }
+
+const STATUSES = [
+  {key:'inprogress', label:'進行中', cls:'inprogress'},
+  {key:'done',       label:'完了',   cls:'done'},
+  {key:'notstarted', label:'未着手', cls:'notstarted'},
+]
+
+let data = []
+let openMenuId = null
+let addingParentId = null // null = root
+
+function genId(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,6) }
+
+function save(){
+  localStorage.setItem('exec_plan_v3', JSON.stringify(data))
+  const el = document.getElementById('save-indicator')
+  el.textContent = '保存済み ✓'
+  setTimeout(()=>el.textContent='', 2000)
+}
+
+function load(){
+  try{ const s=localStorage.getItem('exec_plan_v3'); if(s) data=JSON.parse(s) }catch(e){}
+  if(!data.length) data = defaultData()
+}
+
+function defaultData(){
+  return []
+}
+
+function node(name,status,ds,de,open=false,children=[]){
+  return {id:genId(),name,status,dateStart:ds||'',dateEnd:de||'',open:!!open,children:children||[]}
+}
+
+// ─── Find & mutate helpers ──────────────────
+function findNode(id, list){
+  for(const n of list){
+    if(n.id===id) return n
+    const f=findNode(id,n.children||[])
+    if(f) return f
+  }
+  return null
+}
+
+function removeNode(id, list){
+  for(let i=0;i<list.length;i++){
+    if(list[i].id===id){ list.splice(i,1); return true }
+    if(removeNode(id, list[i].children||[])) return true
+  }
+  return false
+}
+
+function addChild(parentId, newNode){
+  if(parentId===null){ data.push(newNode); return }
+  const p=findNode(parentId,data)
+  if(p){ if(!p.children)p.children=[]; p.children.push(newNode); p.open=true }
+}
+
+// ─── Render ────────────────────────────────
+function render(){
+  document.getElementById('root-list').innerHTML = renderList(data, 0)
+  attachEvents()
+}
+
+function renderList(list, depth){
+  if(!list||!list.length) return ''
+  return list.map(n=>renderNode(n,depth)).join('')
+}
+
+function statusHTML(n){
+  const s=STATUSES.find(x=>x.key===n.status)||STATUSES[2]
+  return `<button class="status-btn ${s.cls}" data-id="${n.id}" onclick="toggleMenu(event,'${n.id}')">
+    <span class="status-dot"></span>${s.label}
+    <div class="status-menu" id="menu-${n.id}" style="display:none">
+      ${STATUSES.map(opt=>`<div class="status-opt opt-${opt.cls}" onclick="setStatus(event,'${n.id}','${opt.key}')"><span class="dot"></span>${opt.label}</div>`).join('')}
+    </div>
+  </button>`
+}
+
+function renderNode(n, depth){
+  const hasChildren = n.children && n.children.length > 0
+  const indent = depth > 0 ? `style="padding-left:${12 + depth*20}px"` : ''
+  const doneClass = n.status==='done' ? 'done-text' : ''
+  const toggleBtn = hasChildren
+    ? `<button class="toggle-btn ${n.open?'open':''}" onclick="toggleOpen('${n.id}')">▶</button>`
+    : `<span class="toggle-spacer"></span>`
+
+  const ds = n.dateStart||''
+  const de = n.dateEnd||''
+
+  let html = `
+  <div class="row-wrap" data-id="${n.id}">
+    <div class="row" ${indent}>
+      <div>${statusHTML(n)}</div>
+      <div class="row-name">
+        ${toggleBtn}
+        <input class="name-input ${doneClass}" data-id="${n.id}" value="${esc(n.name)}" placeholder="名前を入力...">
+      </div>
+      <div class="date-cell">
+        <input class="date-input" data-id="${n.id}" data-field="dateStart" value="${esc(ds)}" placeholder="開始" title="開始日">
+        ${ds||de ? `<span class="date-sep">→</span>` : ''}
+        <input class="date-input" data-id="${n.id}" data-field="dateEnd" value="${esc(de)}" placeholder="期限" title="期限">
+      </div>
+      <div class="row-actions">
+        <button class="icon-btn" title="サブ追加" onclick="startInlineAdd('${n.id}')">＋</button>
+        <button class="icon-btn del" title="削除" onclick="deleteNode('${n.id}')">✕</button>
+      </div>
+    </div>
+    ${addingParentId===n.id ? renderInlineAdd() : ''}
+    ${n.open && hasChildren ? renderList(n.children, depth+1) : ''}
+  </div>`
+  return html
+}
+
+function renderInlineAdd(){
+  return `<div class="inline-add" id="inline-add-form">
+    <select id="add-status" style="background:#0f172a;border:1px solid rgba(212,160,23,.2);color:#e2e8f0;padding:5px 6px;border-radius:7px;font-size:12px;outline:none">
+      ${STATUSES.map(s=>`<option value="${s.key}">${s.label}</option>`).join('')}
+    </select>
+    <input id="add-name" placeholder="プロジェクト名..." autofocus>
+    <div class="date-cell" style="gap:4px">
+      <input id="add-date-start" placeholder="開始" style="background:#0f172a;border:1px solid rgba(212,160,23,.2);color:#e2e8f0;padding:5px 6px;border-radius:7px;font-size:11px;width:70px;outline:none">
+      <span style="color:#334155;font-size:10px">→</span>
+      <input id="add-date-end" placeholder="期限" style="background:#0f172a;border:1px solid rgba(212,160,23,.2);color:#e2e8f0;padding:5px 6px;border-radius:7px;font-size:11px;width:70px;outline:none">
+    </div>
+    <div style="display:flex;gap:4px">
+      <button class="add-confirm" onclick="confirmAdd()">追加</button>
+      <button class="add-cancel" onclick="cancelAdd()">✕</button>
+    </div>
+  </div>`
+}
+
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;') }
+
+// ─── Events ────────────────────────────────
+function attachEvents(){
+  // name inputs
+  document.querySelectorAll('.name-input').forEach(el=>{
+    el.addEventListener('change', e=>{
+      const n=findNode(e.target.dataset.id, data)
+      if(n){ n.name=e.target.value; save(); render() }
+    })
+    el.addEventListener('keydown', e=>{ if(e.key==='Enter') e.target.blur() })
+  })
+  // date inputs
+  document.querySelectorAll('.date-input').forEach(el=>{
+    el.addEventListener('change', e=>{
+      const n=findNode(e.target.dataset.id, data)
+      if(n){ n[e.target.dataset.field]=e.target.value; save() }
+    })
+  })
+  // add-name enter
+  const an=document.getElementById('add-name')
+  if(an) an.addEventListener('keydown', e=>{ if(e.key==='Enter') confirmAdd(); if(e.key==='Escape') cancelAdd() })
+
+  // close menus on outside click
+  document.addEventListener('click', closeMenus, {once:true})
+}
+
+function toggleMenu(e, id){
+  e.stopPropagation()
+  const menu=document.getElementById('menu-'+id)
+  if(!menu) return
+  const wasOpen = menu.style.display==='block'
+  closeMenus()
+  if(!wasOpen){ menu.style.display='block'; openMenuId=id }
+}
+
+function closeMenus(){
+  document.querySelectorAll('.status-menu').forEach(m=>m.style.display='none')
+  openMenuId=null
+}
+
+function setStatus(e, id, status){
+  e.stopPropagation()
+  const n=findNode(id,data)
+  if(n){ n.status=status; save(); render() }
+}
+
+function toggleOpen(id){
+  const n=findNode(id,data)
+  if(n){ n.open=!n.open; render() }
+}
+
+function deleteNode(id){
+  if(!confirm('削除しますか？')) return
+  removeNode(id, data)
+  save(); render()
+}
+
+function startInlineAdd(parentId){
+  addingParentId = parentId
+  if(parentId!==null){
+    const n=findNode(parentId,data)
+    if(n) n.open=true
+  }
+  render()
+  setTimeout(()=>{
+    const el=document.getElementById('add-name')
+    if(el) el.focus()
+  },50)
+}
+
+function confirmAdd(){
+  const name=(document.getElementById('add-name')||{}).value||''
+  if(!name.trim()){ cancelAdd(); return }
+  const status=(document.getElementById('add-status')||{}).value||'notstarted'
+  const ds=(document.getElementById('add-date-start')||{}).value||''
+  const de=(document.getElementById('add-date-end')||{}).value||''
+  const n=node(name.trim(), status, ds, de)
+  addChild(addingParentId, n)
+  addingParentId=null
+  save(); render()
+}
+
+function cancelAdd(){
+  addingParentId=null
+  render()
+}
+
+// ─── Init ──────────────────────────────────
+load()
+render()
+</script>
+</body>
+</html>

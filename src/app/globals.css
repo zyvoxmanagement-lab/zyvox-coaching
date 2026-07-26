@@ -1,0 +1,240 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+/* ── Accent color channels (R G B, space-separated for Tailwind alpha support) ── */
+:root {
+  /* blue (default) */
+  --accent-300: 103 244 255;
+  --accent-400: 0 216 255;
+  --accent-500: 0 180 216;
+  --accent-600: 0 119 182;
+  --accent-hex: #00d8ff;
+
+  --gold: #00b4d8;
+  --gold-light: #00d8ff;
+  --emerald: #10b981;
+  --navy: #040d18;
+  --bg-base: #030b14;
+  --bg-card: rgba(4,18,32,0.85);
+  --bg-input: rgba(3,11,20,0.85);
+  --bg-header: rgba(3,11,20,0.97);
+  --bg-sub: rgba(4,18,32,0.5);
+  --bg-row: rgb(var(--accent-500) / 0.06);
+  --bg-hover: rgb(var(--accent-500) / 0.10);
+  --border-card: rgb(var(--accent-500) / 0.12);
+  --border-input: rgb(var(--accent-500) / 0.18);
+  --border-divider: rgb(var(--accent-600) / 0.25);
+  --border-nav: rgb(var(--accent-500) / 0.15);
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --text-faint: #1e3a4a;
+}
+
+/* ── Yellow theme ── */
+[data-color="yellow"] {
+  --accent-300: 253 224 71;
+  --accent-400: 250 204 21;
+  --accent-500: 202 138 4;
+  --accent-600: 133 77 14;
+  --accent-hex: #facc15;
+  --gold: #ca8a04;
+  --gold-light: #facc15;
+  --bg-base: #0f0c02;
+  --bg-card: rgba(22,18,4,0.85);
+  --bg-input: rgba(15,12,2,0.85);
+  --bg-header: rgba(15,12,2,0.97);
+  --text-faint: #3a2e00;
+}
+
+/* ── Red theme ── */
+[data-color="red"] {
+  --accent-300: 255 170 170;
+  --accent-400: 255 70 70;
+  --accent-500: 220 38 38;
+  --accent-600: 153 27 27;
+  --accent-hex: #ff4646;
+  --gold: #dc2626;
+  --gold-light: #ff4646;
+  --bg-base: #0f0202;
+  --bg-card: rgba(22,4,4,0.85);
+  --bg-input: rgba(15,2,2,0.85);
+  --bg-header: rgba(15,2,2,0.97);
+  --text-faint: #3a0000;
+}
+
+[data-theme="light"] {
+  --bg-base: #f0f4f8;
+  --bg-card: rgba(255,255,255,0.88);
+  --bg-input: rgba(255,255,255,0.95);
+  --bg-header: rgba(240,244,248,0.96);
+  --bg-sub: rgba(240,244,248,0.85);
+  --text-primary: #0a1628;
+  --text-secondary: #334155;
+  --text-muted: #64748b;
+  --text-faint: #cbd5e1;
+}
+
+[data-color="yellow"][data-theme="light"] {
+  --bg-base: #fefce8;
+  --bg-card: rgba(255,253,235,0.88);
+  --bg-input: rgba(255,253,235,0.95);
+  --bg-header: rgba(254,252,232,0.96);
+  --bg-sub: rgba(254,252,232,0.85);
+}
+
+[data-color="red"][data-theme="light"] {
+  --bg-base: #fff1f1;
+  --bg-card: rgba(255,245,245,0.88);
+  --bg-input: rgba(255,245,245,0.95);
+  --bg-header: rgba(255,241,241,0.96);
+  --bg-sub: rgba(255,241,241,0.85);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: #e2e8f0;
+  font-family: 'Inter', 'Hiragino Kaku Gothic ProN', sans-serif;
+}
+
+.theme-bg {
+  background-color: var(--bg-base) !important;
+  color: var(--text-primary) !important;
+  transition: background-color 0.25s, color 0.25s;
+}
+
+.gold-gradient {
+  background: linear-gradient(
+    135deg,
+    rgb(var(--accent-500)),
+    rgb(var(--accent-400)),
+    rgb(var(--accent-300)),
+    rgb(var(--accent-400))
+  );
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.glass-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-card);
+  backdrop-filter: blur(12px);
+}
+
+.glass-card-emerald {
+  background: var(--bg-card);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+  backdrop-filter: blur(12px);
+}
+
+.btn-gold {
+  background: linear-gradient(
+    135deg,
+    rgb(var(--accent-600)),
+    rgb(var(--accent-500)),
+    rgb(var(--accent-400))
+  );
+  color: #030b14;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+
+.btn-gold:hover {
+  opacity: 0.9;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 20px rgb(var(--accent-400) / 0.35);
+}
+
+.btn-emerald {
+  background: linear-gradient(135deg, #059669, #10b981);
+  color: #fff;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+
+.btn-emerald:hover {
+  opacity: 0.9;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 20px rgba(16, 185, 129, 0.3);
+}
+
+.input-dark {
+  background: var(--bg-input);
+  border: 1px solid var(--border-input);
+  color: var(--text-primary);
+  transition: border-color 0.2s;
+  font-size: 16px;
+}
+
+.input-dark:focus {
+  outline: none;
+  border-color: rgb(var(--accent-400) / 0.6);
+  box-shadow: 0 0 0 2px rgb(var(--accent-400) / 0.1);
+}
+
+.input-dark::placeholder {
+  color: var(--text-muted);
+}
+
+/* テーマ対応ユーティリティ */
+.theme-bg { background-color: var(--bg-base) !important; }
+.theme-bg-header { background-color: var(--bg-header) !important; }
+.theme-bg-sub { background-color: var(--bg-sub) !important; }
+.theme-bg-row { background-color: var(--bg-row) !important; }
+.theme-bg-hover:hover { background-color: var(--bg-hover) !important; }
+.theme-border-divider { border-color: var(--border-divider) !important; }
+.theme-border-nav { border-color: var(--border-nav) !important; }
+.theme-text { color: var(--text-primary) !important; }
+.theme-text-secondary { color: var(--text-secondary) !important; }
+.theme-text-muted { color: var(--text-muted) !important; }
+.theme-text-faint { color: var(--text-faint) !important; }
+
+textarea.input-dark {
+  resize: vertical;
+  min-height: 80px;
+}
+
+.level-bar {
+  height: 6px;
+  background: rgb(var(--accent-500) / 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.level-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, rgb(var(--accent-600)), rgb(var(--accent-400)));
+  border-radius: 3px;
+  transition: width 0.6s ease;
+  box-shadow: 0 0 8px rgb(var(--accent-400) / 0.5);
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 4px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgb(var(--accent-400) / 0.25);
+  border-radius: 2px;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.shimmer {
+  background: linear-gradient(90deg, transparent 25%, rgb(var(--accent-400) / 0.08) 50%, transparent 75%);
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite;
+}
