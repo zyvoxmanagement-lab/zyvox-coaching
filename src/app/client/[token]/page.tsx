@@ -1,11 +1,12 @@
 'use client'
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { Fragment, useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { createPortal } from 'react-dom'
 import { useParams, useRouter } from 'next/navigation'
 import { getLevelProgress, getNextLevelThreshold, getLevelFromScore, getCurrentLevelThreshold } from '@/lib/level-system'
 import type { ClientGoal, DailyReport } from '@/lib/supabase'
 
 type Tab = 'home' | 'tasks' | 'report' | 'map' | 'reward' | 'chart' | 'history' | 'plan'
-type WeekStart = 0 | 1
+type WeekStart = 0 | 1 | 2 | 3 | 4 | 5 | 6
 type ChartPeriod = 'daily' | 'weekly' | 'monthly'
 
 type Completion = { task_id: string; slot_id?: string; completion_date: string; completed: boolean }
@@ -43,10 +44,18 @@ function getWeekDates(weekStart: string): string[] {
   })
 }
 
+function getTestToday(): Date {
+  if (typeof window !== 'undefined') {
+    const p = new URLSearchParams(window.location.search).get('_testDate')
+    if (p) { const d = new Date(p + 'T00:00:00'); if (!isNaN(d.getTime())) return d }
+  }
+  return new Date()
+}
+
 function getAnchorDate(weekStartDay: WeekStart, offset: number): string {
-  const today = new Date()
+  const today = getTestToday()
   const day = today.getDay()
-  const daysBack = weekStartDay === 1 ? (day === 0 ? 6 : day - 1) : day
+  const daysBack = (day - weekStartDay + 7) % 7
   const monday = new Date(today)
   monday.setDate(today.getDate() - daysBack + offset * 7)
   return localDate(monday)
@@ -54,6 +63,57 @@ function getAnchorDate(weekStartDay: WeekStart, offset: number): string {
 
 function ck(slotId: string, date: string) { return `${slotId}_${date}` }
 function genId() { return Math.random().toString(36).slice(2, 10) }
+// タッチドラッグ用グローバルref（refはrenderをまたいでも最新値を保持）
+const touchDragRef = { id: null as string | null, attr: 'data-drag-id' }
+
+function makeTouchHandlers(
+  myId: string,
+  setDraggingId: (id: string | null) => void,
+  setDropTarget: (t: { id: string; pos: 'before' | 'after' } | null) => void,
+  onDrop: (fromId: string, toId: string, before: boolean) => void,
+  attr = 'data-drag-id'
+) {
+  function findTarget(x: number, y: number): { id: string; el: HTMLElement } | null {
+    for (const el of Array.from(document.querySelectorAll<HTMLElement>(`[${attr}]`))) {
+      const r = el.getBoundingClientRect()
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        const id = el.getAttribute(attr)
+        if (id && id !== myId) return { id, el }
+      }
+    }
+    return null
+  }
+  return {
+    style: { touchAction: 'none' as const },
+    onTouchStart: (e: React.TouchEvent) => {
+      e.stopPropagation()
+      touchDragRef.id = myId; touchDragRef.attr = attr
+      setDraggingId(myId)
+    },
+    onTouchMove: (e: React.TouchEvent) => {
+      if (touchDragRef.id !== myId) return
+      e.preventDefault(); e.stopPropagation()
+      const t = e.touches[0]
+      const found = findTarget(t.clientX, t.clientY)
+      if (found) {
+        const r = found.el.getBoundingClientRect()
+        setDropTarget({ id: found.id, pos: t.clientY < r.top + r.height / 2 ? 'before' : 'after' })
+      } else setDropTarget(null)
+    },
+    onTouchEnd: (e: React.TouchEvent) => {
+      if (touchDragRef.id !== myId) return
+      const t = e.changedTouches[0]
+      const found = findTarget(t.clientX, t.clientY)
+      if (found) {
+        const r = found.el.getBoundingClientRect()
+        onDrop(myId, found.id, t.clientY < r.top + r.height / 2)
+      }
+      touchDragRef.id = null
+      setDraggingId(null); setDropTarget(null)
+    },
+  }
+}
+
 function parseMemo(memo: string | null | undefined): TimeSlot[] {
   if (!memo) return []
   try { return JSON.parse(memo) as TimeSlot[] } catch { return [] }
@@ -63,7 +123,7 @@ function parseMemo(memo: string | null | undefined): TimeSlot[] {
 // Execution Plan Tab
 // ──────────────────────────────────────────
 type PlanStatus = 'notstarted' | 'inprogress' | 'done'
-type PlanNode = { id: string; title: string; status: PlanStatus; startDate: string; endDate: string; children: PlanNode[]; collapsed: boolean; struck?: boolean }
+type PlanNode = { id: string; title: string; status: PlanStatus; startDate: string; endDate: string; children: PlanNode[]; collapsed: boolean; struck?: boolean; fontSize?: 'xs' | 'sm' | 'base' | 'lg' | 'xl' }
 
 type PlanVersion = { id: string; date: string; nodes: PlanNode[] }
 
@@ -114,7 +174,7 @@ function reorderNodes(nodes: PlanNode[], draggedId: string, targetId: string, be
   return insert(without)
 }
 
-function PlanRow({ node, depth, onUpdate, onRemove, onAddChild, lang, draggedId, onDragStart, onDrop }: {
+function PlanRow({ node, depth, onUpdate, onRemove, onAddChild, lang, draggedId, onDragStart, onDrop, currentMonthLabel }: {
   node: PlanNode; depth: number; lang: 'en' | 'ja'
   onUpdate: (id: string, u: (n: PlanNode) => PlanNode) => void
   onRemove: (id: string) => void
@@ -122,33 +182,22 @@ function PlanRow({ node, depth, onUpdate, onRemove, onAddChild, lang, draggedId,
   draggedId: string | null
   onDragStart: (id: string) => void
   onDrop: (targetId: string, before: boolean) => void
+  currentMonthLabel?: string
 }) {
-  const [editing, setEditing] = useState<'title' | 'start' | 'end' | null>(null)
-  const [draft, setDraft] = useState('')
   const [dropPos, setDropPos] = useState<'before' | 'after' | null>(null)
 
-  function startEdit(field: 'title' | 'start' | 'end') {
-    setEditing(field)
-    setDraft(field === 'title' ? node.title : field === 'start' ? node.startDate : node.endDate)
-  }
-  function commit(field: 'title' | 'start' | 'end') {
-    onUpdate(node.id, n => ({ ...n, [field === 'title' ? 'title' : field === 'start' ? 'startDate' : 'endDate']: draft }))
-    setEditing(null)
-  }
   function cycleStatus() {
     const order: PlanStatus[] = ['notstarted', 'inprogress', 'done']
     const next = order[(order.indexOf(node.status) + 1) % 3]
     onUpdate(node.id, n => ({ ...n, status: next }))
   }
 
-  const indent = depth * 16
+  const indent = depth * 12
   const isDragging = draggedId === node.id
 
   return (
     <>
       <div
-        draggable
-        onDragStart={e => { e.stopPropagation(); onDragStart(node.id) }}
         onDragOver={e => {
           if (draggedId === node.id) return
           e.preventDefault(); e.stopPropagation()
@@ -158,79 +207,72 @@ function PlanRow({ node, depth, onUpdate, onRemove, onAddChild, lang, draggedId,
         onDragLeave={() => setDropPos(null)}
         onDrop={e => { e.preventDefault(); e.stopPropagation(); if (dropPos) { onDrop(node.id, dropPos === 'before'); setDropPos(null) } }}
         onDragEnd={() => setDropPos(null)}
-        className={`flex items-center gap-2 px-3 py-2 border-b border-slate-800/40 hover:bg-slate-800/20 transition-colors relative ${isDragging ? 'opacity-40' : ''}`}
-        style={{ paddingLeft: `${12 + indent}px` }}
+        className={`flex items-center gap-1.5 px-2 py-1.5 border-b border-slate-800/40 hover:bg-slate-800/20 transition-colors relative ${isDragging ? 'opacity-40' : ''} ${depth === 0 ? 'mt-4 first:mt-0' : ''}`}
+        style={{ paddingLeft: `${8 + indent}px` }}
       >
         {dropPos === 'before' && <div className="absolute top-0 left-0 right-0 h-0.5 bg-gold-400 pointer-events-none" />}
         {dropPos === 'after' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gold-400 pointer-events-none" />}
 
         {/* drag handle */}
-        <span className="text-slate-500 hover:text-slate-300 text-sm cursor-grab active:cursor-grabbing shrink-0 select-none leading-none">⠿</span>
-
-        {/* toggle */}
-        <button
-          onClick={() => onUpdate(node.id, n => ({ ...n, collapsed: !n.collapsed }))}
-          className="w-4 h-4 shrink-0 flex items-center justify-center text-slate-600 hover:text-slate-400 text-[10px]"
-        >
-          {node.children.length > 0 ? (node.collapsed ? '▶' : '▼') : <span className="w-2 h-2 rounded-full bg-slate-700 inline-block" />}
-        </button>
+        <span draggable onDragStart={e => { e.stopPropagation(); onDragStart(node.id) }}
+          className="text-slate-700 hover:text-slate-500 text-sm cursor-grab active:cursor-grabbing shrink-0 select-none leading-none">⠿</span>
 
         {/* status badge */}
-        <button
-          onClick={cycleStatus}
-          className="shrink-0 px-1.5 py-0.5 rounded text-[9px] font-bold border transition-colors"
-          style={{ color: STATUS_COLORS[node.status], borderColor: STATUS_COLORS[node.status] + '60', background: STATUS_COLORS[node.status] + '18' }}
-        >
+        <button onClick={cycleStatus} className="shrink-0 px-1.5 py-0.5 rounded text-[9px] font-bold border transition-colors whitespace-nowrap"
+          style={{ color: STATUS_COLORS[node.status], borderColor: STATUS_COLORS[node.status] + '60', background: STATUS_COLORS[node.status] + '18' }}>
           {(lang === 'en' ? STATUS_LABELS_EN : STATUS_LABELS_JA)[node.status]}
         </button>
 
-        {/* title */}
-        {editing === 'title' ? (
-          <input
-            autoFocus
-            value={draft}
-            onChange={e => setDraft(e.target.value)}
-            onBlur={() => commit('title')}
-            onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) commit('title'); if (e.key === 'Escape') setEditing(null) }}
-            className="input-dark flex-1 min-w-0 px-2 py-1 rounded-lg text-xs"
-          />
-        ) : (
-          <button onClick={() => startEdit('title')} className={`flex-1 min-w-0 text-left text-xs truncate ${node.struck ? 'line-through text-red-400/70' : 'text-slate-200 hover:text-white'}`}>{node.title || <span className="text-slate-600">{lang === 'en' ? 'Enter title...' : 'タイトルを入力...'}</span>}</button>
-        )}
+        {/* 子展開トグル：常に表示（子がない時はグレー表示） */}
+        <button onClick={() => node.children.length > 0 && onUpdate(node.id, n => ({ ...n, collapsed: !n.collapsed }))}
+          className={`shrink-0 w-6 h-6 flex items-center justify-center rounded transition-colors text-[10px] ${node.children.length > 0 ? 'text-slate-400 hover:text-white hover:bg-slate-700/50 cursor-pointer' : 'text-slate-700 cursor-default'}`}>
+          {node.collapsed ? '▶' : '▼'}
+        </button>
 
-        {/* dates */}
-        <div className="flex items-center gap-1 shrink-0">
-          {editing === 'start' ? (
-            <input autoFocus type="date" value={draft} onChange={e => setDraft(e.target.value)} onBlur={() => commit('start')} className="input-dark w-28 px-1 py-0.5 rounded text-[10px] text-center" />
-          ) : (
-            <button onClick={() => startEdit('start')} className="text-[10px] text-slate-500 hover:text-slate-300 w-16 text-center">{node.startDate || (lang === 'en' ? 'Start' : '開始')}</button>
-          )}
-          <span className="text-slate-700 text-[9px]">→</span>
-          {editing === 'end' ? (
-            <input autoFocus type="date" value={draft} onChange={e => setDraft(e.target.value)} onBlur={() => commit('end')} className="input-dark w-28 px-1 py-0.5 rounded text-[10px] text-center" />
-          ) : (
-            <button onClick={() => startEdit('end')} className="text-[10px] text-slate-500 hover:text-slate-300 w-16 text-center">{node.endDate || (lang === 'en' ? 'Due' : '期限')}</button>
-          )}
-        </div>
+        {/* title */}
+        {(() => {
+          const isCurrentMonth = !!(currentMonthLabel && node.title.startsWith(currentMonthLabel))
+          const sizeClass = node.fontSize ? `text-${node.fontSize}` : depth === 0 ? 'text-base' : isCurrentMonth ? 'text-sm' : 'text-xs'
+          const weightClass = (node.fontSize && ['lg','xl'].includes(node.fontSize)) || depth === 0 ? 'font-bold' : isCurrentMonth ? 'font-semibold' : ''
+          const colorClass = node.status === 'done' ? 'text-slate-500' : depth === 0 || isCurrentMonth ? 'text-white' : 'text-slate-200'
+          return (
+            <RichEditor
+              value={node.title}
+              onChange={v => onUpdate(node.id, n => ({ ...n, title: v }))}
+              placeholder={lang === 'en' ? 'Title...' : 'タイトル...'}
+              multiline
+              showSize={false}
+              className={`flex-1 min-w-0 py-0.5 ${sizeClass} ${weightClass} ${colorClass}`}
+            />
+          )
+        })()}
 
         {/* actions */}
-        <button onClick={() => onUpdate(node.id, n => ({ ...n, struck: !n.struck }))} className={`shrink-0 w-5 h-5 flex items-center justify-center text-[10px] transition-colors ${node.struck ? 'text-red-400' : 'text-slate-600 hover:text-red-400'}`} title={lang === 'en' ? 'Strike through' : '訂正線'}>S̶</button>
-        <button onClick={() => onAddChild(node.id)} className="shrink-0 w-5 h-5 flex items-center justify-center text-slate-600 hover:text-gold-400 text-[11px] transition-colors">＋</button>
-        <button onClick={() => { if (confirm(lang === 'en' ? 'Delete?' : '削除しますか？')) onRemove(node.id) }} className="shrink-0 w-5 h-5 flex items-center justify-center text-slate-700 hover:text-red-400 text-[10px] transition-colors">✕</button>
+        <button onClick={() => {
+          const sizes: PlanNode['fontSize'][] = [undefined, 'xs', 'sm', 'base', 'lg', 'xl']
+          const cur = sizes.indexOf(node.fontSize)
+          const next = sizes[(cur + 1) % sizes.length]
+          onUpdate(node.id, n => ({ ...n, fontSize: next }))
+        }} className="shrink-0 w-7 h-5 flex items-center justify-center text-slate-500 hover:text-gold-400 text-[9px] font-bold transition-colors" title="文字サイズ">
+          {!node.fontSize ? 'A' : node.fontSize === 'xs' ? 'A·1' : node.fontSize === 'sm' ? 'A·2' : node.fontSize === 'base' ? 'A·3' : node.fontSize === 'lg' ? 'A·4' : 'A·5'}
+        </button>
+        <button onClick={() => onAddChild(node.id)} className="shrink-0 w-5 h-5 flex items-center justify-center text-slate-700 hover:text-gold-400 text-[11px] transition-colors">＋</button>
+        <button onClick={() => { if (confirm(lang === 'en' ? 'Delete?' : '削除？')) onRemove(node.id) }} className="shrink-0 w-5 h-5 flex items-center justify-center text-slate-800 hover:text-red-400 text-[10px] transition-colors">✕</button>
       </div>
 
       {!node.collapsed && node.children.map(child => (
-        <PlanRow key={child.id} node={child} depth={depth + 1} onUpdate={onUpdate} onRemove={onRemove} onAddChild={onAddChild} lang={lang} draggedId={draggedId} onDragStart={onDragStart} onDrop={onDrop} />
+        <PlanRow key={child.id} node={child} depth={depth + 1} onUpdate={onUpdate} onRemove={onRemove} onAddChild={onAddChild} lang={lang} draggedId={draggedId} onDragStart={onDragStart} onDrop={onDrop} currentMonthLabel={currentMonthLabel} />
       ))}
     </>
   )
 }
 
-function PlanCard({ version, lang, onSave, onDuplicate, onDelete }: {
+function PlanCard({ version, lang, onSave, onDuplicate, onDelete, currentMonthLabel }: {
   version: PlanVersion; lang: 'en' | 'ja'
   onSave: (id: string, nodes: PlanNode[]) => void
   onDuplicate: (id: string) => void
   onDelete: (id: string) => void
+  currentMonthLabel?: string
 }) {
   const [nodes, setNodes] = useState<PlanNode[]>(version.nodes)
   const [saved, setSaved] = useState(false)
@@ -261,6 +303,13 @@ function PlanCard({ version, lang, onSave, onDuplicate, onDelete }: {
         <span className="text-xs text-slate-500 font-medium">{version.date}</span>
         <div className="flex items-center gap-2">
           {saved && <span className="text-[10px] text-emerald-400">{lang === 'en' ? 'Saved ✓' : '保存 ✓'}</span>}
+          <button onClick={() => {
+            const blob = new Blob([JSON.stringify({ version, exportedAt: new Date().toISOString() }, null, 2)], { type: 'application/json' })
+            const a = document.createElement('a'); a.href = URL.createObjectURL(blob)
+            a.download = `plan-backup-${version.date}.json`; a.click()
+          }} className="text-[10px] text-slate-500 hover:text-emerald-400 border border-slate-700 hover:border-emerald-500/50 px-2 py-0.5 rounded transition-colors">
+            {lang === 'en' ? '↓ Backup' : '↓ バックアップ'}
+          </button>
           <button onClick={() => onDuplicate(version.id)} className="text-[10px] text-slate-500 hover:text-gold-400 border border-slate-700 hover:border-gold-500/50 px-2 py-0.5 rounded transition-colors">
             {lang === 'en' ? 'Duplicate' : '複製'}
           </button>
@@ -268,22 +317,11 @@ function PlanCard({ version, lang, onSave, onDuplicate, onDelete }: {
         </div>
       </div>
       <div className="glass-card rounded-2xl overflow-hidden">
-        <div className="flex items-center gap-2 px-3 py-2 border-b border-slate-700/60 bg-slate-800/40">
-          <div className="w-4 shrink-0" />
-          <div className="w-14 shrink-0 text-[9px] text-slate-500 font-bold uppercase tracking-wider">{lang === 'en' ? 'Status' : '状態'}</div>
-          <div className="flex-1 text-[9px] text-slate-500 font-bold uppercase tracking-wider">{lang === 'en' ? 'Project / Task' : 'プロジェクト / タスク'}</div>
-          <div className="flex gap-1 shrink-0">
-            <div className="w-16 text-[9px] text-slate-500 text-center">{lang === 'en' ? 'Start' : '開始'}</div>
-            <div className="w-2" />
-            <div className="w-16 text-[9px] text-slate-500 text-center">{lang === 'en' ? 'Due' : '期限'}</div>
-          </div>
-          <div className="w-10 shrink-0" />
-        </div>
         {nodes.length === 0 ? (
           <div className="py-8 text-center text-slate-600 text-sm">{lang === 'en' ? 'No projects yet' : 'プロジェクトがありません'}</div>
         ) : (
           nodes.map(node => (
-            <PlanRow key={node.id} node={node} depth={0} onUpdate={handleUpdate} onRemove={handleRemove} onAddChild={handleAddChild} lang={lang} draggedId={draggedId} onDragStart={setDraggedId} onDrop={handleDrop} />
+            <PlanRow key={node.id} node={node} depth={0} onUpdate={handleUpdate} onRemove={handleRemove} onAddChild={handleAddChild} lang={lang} draggedId={draggedId} onDragStart={setDraggedId} onDrop={handleDrop} currentMonthLabel={currentMonthLabel} />
           ))
         )}
         <div className="px-3 py-2 border-t border-slate-800/40">
@@ -296,27 +334,163 @@ function PlanCard({ version, lang, onSave, onDuplicate, onDelete }: {
   )
 }
 
+// ──────────────────────────────────────────
+// Rich Text Editor
+// ──────────────────────────────────────────
+const RICH_COLORS = ['#ef4444', '#f59e0b', '#10b981', '#60a5fa', '#c084fc', '#fb923c', '#e2e8f0', '#64748b']
+
+function RichEditor({ value, onChange, placeholder, className, multiline = false, onClick, showSize = true }: {
+  value: string; onChange: (v: string) => void
+  placeholder?: string; className?: string; multiline?: boolean
+  onClick?: (e: React.MouseEvent) => void; showSize?: boolean
+}) {
+  const ref = useRef<HTMLDivElement>(null)
+  const focused = useRef(false)
+  const [toolbar, setToolbar] = useState<{ x: number; y: number } | null>(null)
+
+  // 初回マウント時にのみ値をセット
+  useEffect(() => {
+    if (ref.current) ref.current.innerHTML = value
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // 外部からの値変更（週切替など）はフォーカス外のときだけ反映
+  // value が空のときは絶対に上書きしない（ローカル入力済み内容を守る）
+  useEffect(() => {
+    if (ref.current && !focused.current && value !== '') ref.current.innerHTML = value
+  }, [value])
+
+  const savedRange = useRef<Range | null>(null)
+
+  function checkSel() {
+    const sel = window.getSelection()
+    if (!sel || sel.isCollapsed) { setToolbar(null); return }
+    // anchorNode と focusNode のどちらかが ref 内にあれば表示
+    const inEditor = ref.current?.contains(sel.anchorNode) || ref.current?.contains(sel.focusNode)
+    if (!inEditor) return
+    savedRange.current = sel.getRangeAt(0).cloneRange()
+    const r = sel.getRangeAt(0).getBoundingClientRect()
+    if (r.width === 0 && r.height === 0) return
+    setToolbar({ x: r.left + r.width / 2, y: r.top })
+  }
+
+  useEffect(() => {
+    let debounce: ReturnType<typeof setTimeout>
+    const onSC = () => { clearTimeout(debounce); debounce = setTimeout(checkSel, 150) }
+    document.addEventListener('mouseup', checkSel)
+    document.addEventListener('touchend', checkSel)
+    document.addEventListener('selectionchange', onSC)
+    return () => {
+      document.removeEventListener('mouseup', checkSel)
+      document.removeEventListener('touchend', checkSel)
+      document.removeEventListener('selectionchange', onSC)
+      clearTimeout(debounce)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  function applyFmt(cmd: string, val?: string) {
+    // タッチ時にフォーカスが外れても選択範囲を保持して適用
+    const sel = window.getSelection()
+    const range = savedRange.current ?? (sel && sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null)
+    ref.current?.focus()
+    if (range && sel) { sel.removeAllRanges(); sel.addRange(range) }
+    document.execCommand(cmd, false, val)
+    onChange(ref.current?.innerHTML ?? '')
+    savedRange.current = null
+    setToolbar(null)
+  }
+
+  return (
+    <>
+      {toolbar && typeof document !== 'undefined' && createPortal(
+        <div
+          className="fixed z-[9999] flex items-center gap-1 bg-slate-900 border border-slate-600/80 rounded-xl px-2.5 py-1.5 shadow-2xl"
+          style={{ right: 12, top: 60 }}
+          onMouseDown={e => e.preventDefault()}
+          onTouchStart={e => e.preventDefault()}
+        >
+          <button onMouseDown={() => applyFmt('strikeThrough')} onTouchEnd={e => { e.preventDefault(); applyFmt('strikeThrough') }} className="text-[11px] text-slate-300 hover:text-white px-1.5 py-0.5 rounded hover:bg-slate-700 line-through font-mono">S</button>
+          <div className="w-px h-3 bg-slate-700 mx-0.5" />
+          {showSize && <>
+            {(['1','2','3','4','5'] as string[]).map((sz, i) => (
+              <button key={sz} onMouseDown={() => { document.execCommand('styleWithCSS', false, 'true'); applyFmt('fontSize', sz) }} onTouchEnd={e => { e.preventDefault(); document.execCommand('styleWithCSS', false, 'true'); applyFmt('fontSize', sz) }} style={{ fontSize: [7,9,11,13,15][i] }} className="text-slate-300 hover:text-yellow-300 px-0.5 py-0.5 rounded hover:bg-slate-700 font-bold leading-none">A</button>
+            ))}
+            <div className="w-px h-3 bg-slate-700 mx-0.5" />
+          </>}
+          {RICH_COLORS.map(c => (
+            <button key={c} onMouseDown={() => applyFmt('foreColor', c)} onTouchEnd={e => { e.preventDefault(); applyFmt('foreColor', c) }}
+              className="w-3.5 h-3.5 rounded-full border border-white/10 hover:scale-110 transition-transform flex-shrink-0"
+              style={{ background: c }} />
+          ))}
+          <div className="w-px h-3 bg-slate-700 mx-0.5" />
+          <button onMouseDown={() => applyFmt('removeFormat')} onTouchEnd={e => { e.preventDefault(); applyFmt('removeFormat') }} className="text-[9px] text-slate-500 hover:text-slate-300 px-1 py-0.5 rounded hover:bg-slate-700">✕</button>
+        </div>,
+        document.body
+      )}
+      <div
+        ref={ref}
+        contentEditable
+        suppressContentEditableWarning
+        onFocus={() => { focused.current = true }}
+        onBlur={() => { focused.current = false; onChange(ref.current?.innerHTML ?? ''); setTimeout(() => setToolbar(null), 200) }}
+        onInput={() => onChange(ref.current?.innerHTML ?? '')}
+        onPaste={e => { e.preventDefault(); const text = e.clipboardData.getData('text/plain'); document.execCommand('insertText', false, text) }}
+        onMouseUp={checkSel}
+        onKeyUp={checkSel}
+        onClick={onClick}
+        className={className}
+        style={{ outline: 'none', whiteSpace: multiline ? 'pre-wrap' : 'nowrap', overflowX: 'hidden', wordBreak: 'break-all' }}
+        data-placeholder={placeholder}
+      />
+    </>
+  )
+}
+
 function ExecutionPlanTab({ token, lang }: { token: string; lang: 'en' | 'ja' }) {
   const VERSIONS_KEY = `exec_plans_${token}`
   const OLD_KEY = `exec_plan_v1_${token}`
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const [versions, setVersions] = useState<PlanVersion[]>(() => {
-    if (typeof window === 'undefined') return []
-    try {
-      const existing = localStorage.getItem(VERSIONS_KEY)
-      if (existing) return JSON.parse(existing)
-      const old = localStorage.getItem(OLD_KEY)
-      if (old) {
-        const today = localDate(new Date())
-        return [{ id: planGenId(), date: today, nodes: JSON.parse(old) }]
-      }
-      return []
-    } catch { return [] }
-  })
+  const [versions, setVersions] = useState<PlanVersion[]>([])
+  const [planLoaded, setPlanLoaded] = useState(false)
+
+  // DBから読み込み（localStorageからマイグレーション）
+  useEffect(() => {
+    fetch(`/api/client/${token}/plan`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.versions && d.versions.length > 0) {
+          setVersions(d.versions)
+        } else {
+          // localStorageからマイグレーション
+          try {
+            const existing = localStorage.getItem(VERSIONS_KEY)
+            if (existing) { const vs = JSON.parse(existing); setVersions(vs); saveToDb(vs) }
+            else {
+              const old = localStorage.getItem(OLD_KEY)
+              if (old) { const today = localDate(new Date()); const vs = [{ id: planGenId(), date: today, nodes: JSON.parse(old) }]; setVersions(vs); saveToDb(vs) }
+            }
+          } catch {}
+        }
+        setPlanLoaded(true)
+      })
+      .catch(() => { setPlanLoaded(true) })
+  }, [token])
+
+  function saveToDb(updated: PlanVersion[]) {
+    if (saveTimer.current) clearTimeout(saveTimer.current)
+    saveTimer.current = setTimeout(() => {
+      fetch(`/api/client/${token}/plan`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ versions: updated }),
+      })
+    }, 600)
+  }
 
   function persist(updated: PlanVersion[]) {
     setVersions(updated)
-    localStorage.setItem(VERSIONS_KEY, JSON.stringify(updated))
+    saveToDb(updated)
   }
 
   function handleSave(id: string, nodes: PlanNode[]) {
@@ -332,15 +506,6 @@ function ExecutionPlanTab({ token, lang }: { token: string; lang: 'en' | 'ja' })
   }
 
   function handleDelete(id: string) {
-    const target = versions.find(v => v.id === id)
-    if (target) {
-      const TRASH_KEY = `exec_plans_trash_${token}`
-      try {
-        const existing = localStorage.getItem(TRASH_KEY)
-        const trash: PlanVersion[] = existing ? JSON.parse(existing) : []
-        localStorage.setItem(TRASH_KEY, JSON.stringify([target, ...trash]))
-      } catch {}
-    }
     persist(versions.filter(v => v.id !== id))
   }
 
@@ -359,13 +524,15 @@ function ExecutionPlanTab({ token, lang }: { token: string; lang: 'en' | 'ja' })
         </button>
       </div>
 
-      {versions.length === 0 ? (
+      {!planLoaded ? (
+        <div className="glass-card rounded-2xl py-12 text-center text-slate-600 text-sm">読み込み中...</div>
+      ) : versions.length === 0 ? (
         <div className="glass-card rounded-2xl py-12 text-center text-slate-600 text-sm">
           {lang === 'en' ? 'No plans yet' : '計画がありません'}
         </div>
       ) : (
         versions.map(v => (
-          <PlanCard key={v.id} version={v} lang={lang} onSave={handleSave} onDuplicate={handleDuplicate} onDelete={handleDelete} />
+          <PlanCard key={v.id} version={v} lang={lang} onSave={handleSave} onDuplicate={handleDuplicate} onDelete={handleDelete} currentMonthLabel={`${new Date().getMonth() + 1}月`} />
         ))
       )}
     </>
@@ -428,9 +595,9 @@ function MapNode({ nodeKey, label, accent = false, size = 'md', val, isEditing, 
           onClick={e => e.stopPropagation()}
         />
       ) : (
-        <div className={`${textSize} ${val ? 'text-slate-300' : 'text-slate-600'} leading-relaxed line-clamp-3 min-h-[2.5rem]`}>
-          {val || 'タップして入力...'}
-        </div>
+        <div className={`${textSize} ${val ? 'text-slate-300' : 'text-slate-600'} leading-relaxed line-clamp-3 min-h-[2.5rem]`}
+          {...(val ? { dangerouslySetInnerHTML: { __html: val } } : {})}
+        >{val ? undefined : 'タップして入力...'}</div>
       )}
       {savedKey === nodeKey && !isEditing && (
         <span className="absolute top-1 right-2 text-[9px] text-emerald-400">保存 ✓</span>
@@ -455,7 +622,7 @@ function makeDefaultGoalLabels(): Record<string, string> {
   const y3m = m + 3 > 12 ? y + 1 : y
   const pad = (n: number) => String(n).padStart(2, '0')
   return {
-    goal_3y: `${y + 3}-${pad(m)}-${pad(d)}`,
+    goal_3y: `${y + 5}-${pad(m)}-${pad(d)}`,
     goal_1y: `${y + 1}-${pad(m)}-${pad(d)}`,
     goal_3m: `${y3m}-${pad(m3)}-${pad(d)}`,
   }
@@ -480,12 +647,16 @@ function goalRemainingText(label: string, lang: 'en' | 'ja' = 'ja'): string {
   const now = new Date()
   const months = (parsed.year - now.getFullYear()) * 12 + (parsed.month - (now.getMonth() + 1))
   if (months <= 0) return ''
+  const yrs = Math.floor(months / 12)
+  const mos = months % 12
   if (lang === 'en') {
-    if (months >= 12) return `${Math.round(months / 12)}y left`
-    return `${months}mo left`
+    if (yrs > 0 && mos > 0) return `${yrs}y ${mos}mo left`
+    if (yrs > 0) return `${yrs}y left`
+    return `${mos}mo left`
   }
-  if (months >= 12) return `あと${Math.round(months / 12)}年`
-  return `あと${months}ヶ月`
+  if (yrs > 0 && mos > 0) return `あと${yrs}年${mos}ヶ月`
+  if (yrs > 0) return `あと${yrs}年`
+  return `あと${mos}ヶ月`
 }
 
 function formatGoalLabel(label: string, lang: 'en' | 'ja'): string {
@@ -584,30 +755,41 @@ function SingleMapCard({ mapData, token, onDelete, lang, onGoalLabelsChange }: {
               const label = goalLabels[key] ?? DEFAULT_GOAL_LABELS[key]
               const parsed = parseGoalLabel(label) ?? { year: new Date().getFullYear() + 1, month: new Date().getMonth() + 1, day: new Date().getDate() }
               const remaining = goalRemainingText(label, lang)
-              const nowY = new Date().getFullYear()
               const nodeSize = key === 'goal_3y' ? 'lg' : key === 'goal_1y' ? 'md' : 'sm'
-              const titleSize = key === 'goal_3y' ? 'text-[11px]' : key === 'goal_1y' ? 'text-[10px]' : 'text-[9px]'
-              const selectSize = key === 'goal_3y' ? 'text-[10px]' : 'text-[9px]'
+              const pad = (n: number) => String(n).padStart(2, '0')
+              function adjYear(d: number) {
+                const ny = Math.max(new Date().getFullYear(), parsed.year + d)
+                setGoalDeadline(key, `${ny}-${pad(parsed.month)}-${pad(parsed.day)}`)
+              }
+              function adjMonth(d: number) {
+                let nm = parsed.month + d
+                let ny = parsed.year
+                if (nm > 12) { nm -= 12; ny++ }
+                if (nm < 1) { nm += 12; ny-- }
+                if (ny < new Date().getFullYear()) return
+                setGoalDeadline(key, `${ny}-${pad(nm)}-${pad(parsed.day)}`)
+              }
               return (
-                <div key={key} className="glass-card rounded-xl p-2 flex flex-col gap-1.5">
-                  <div className={`${titleSize} text-gold-400/70 font-bold text-center`}>
-                    {key === 'goal_3y' ? (lang === 'en' ? '3Y Goal' : '3年後') : key === 'goal_1y' ? (lang === 'en' ? '1Y Goal' : '1年後') : (lang === 'en' ? '3M Goal' : '3ヶ月後')}
+                <div key={key} className="glass-card rounded-xl p-2 flex flex-col gap-2">
+                  {/* あとN年 badge */}
+                  <div className="text-center">
+                    {remaining
+                      ? <span className="text-[11px] font-bold text-gold-400">{remaining}</span>
+                      : <span className="text-[10px] text-slate-600">—</span>
+                    }
                   </div>
-                  <div className="flex gap-1 justify-center flex-wrap">
-                    <select value={parsed.year} onChange={e => setGoalDeadline(key, `${e.target.value}-${String(parsed.month).padStart(2,'0')}-${String(parsed.day).padStart(2,'0')}`)}
-                      className={`input-dark ${selectSize} px-1 py-0.5 rounded text-center appearance-none`}>
-                      {Array.from({ length: 13 }, (_, i) => nowY - 1 + i).map(y => <option key={y} value={y}>{y}</option>)}
-                    </select>
-                    <select value={parsed.month} onChange={e => setGoalDeadline(key, `${parsed.year}-${String(e.target.value).padStart(2,'0')}-${String(parsed.day).padStart(2,'0')}`)}
-                      className={`input-dark ${selectSize} px-1 py-0.5 rounded text-center appearance-none`}>
-                      {Array.from({ length: 12 }, (_, i) => i + 1).map(m => <option key={m} value={m}>{m}</option>)}
-                    </select>
-                    <select value={parsed.day} onChange={e => setGoalDeadline(key, `${parsed.year}-${String(parsed.month).padStart(2,'0')}-${String(e.target.value).padStart(2,'0')}`)}
-                      className={`input-dark ${selectSize} px-1 py-0.5 rounded text-center appearance-none`}>
-                      {Array.from({ length: 31 }, (_, i) => i + 1).map(d => <option key={d} value={d}>{d}</option>)}
-                    </select>
+                  {/* year picker */}
+                  <div className="flex items-center justify-between gap-0.5">
+                    <button onPointerDown={e => { e.preventDefault(); adjYear(-1) }} className="w-5 h-5 flex items-center justify-center text-slate-500 hover:text-white text-[11px] rounded hover:bg-slate-700/50">‹</button>
+                    <span className="text-[11px] text-slate-200 font-medium flex-1 text-center">{parsed.year}年</span>
+                    <button onPointerDown={e => { e.preventDefault(); adjYear(1) }} className="w-5 h-5 flex items-center justify-center text-slate-500 hover:text-white text-[11px] rounded hover:bg-slate-700/50">›</button>
                   </div>
-                  {remaining && <div className="text-[9px] text-slate-400 text-center">{remaining}</div>}
+                  {/* month picker */}
+                  <div className="flex items-center justify-between gap-0.5">
+                    <button onPointerDown={e => { e.preventDefault(); adjMonth(-1) }} className="w-5 h-5 flex items-center justify-center text-slate-500 hover:text-white text-[11px] rounded hover:bg-slate-700/50">‹</button>
+                    <span className="text-[10px] text-slate-400 flex-1 text-center">{parsed.month}月</span>
+                    <button onPointerDown={e => { e.preventDefault(); adjMonth(1) }} className="w-5 h-5 flex items-center justify-center text-slate-500 hover:text-white text-[11px] rounded hover:bg-slate-700/50">›</button>
+                  </div>
                   <MapNode nodeKey={key} size={nodeSize} label="" {...nodeProps(key)} />
                 </div>
               )
@@ -1149,7 +1331,33 @@ export default function ClientPortal() {
   const token = params.token as string
 
   const [data, setData] = useState<ClientData | null>(null)
-  const [tab, setTab] = useState<Tab>('home')
+  const [tab, setTabRaw] = useState<Tab>('home')
+  const tabHistory = useRef<Tab[]>(['home'])
+  const tabHistoryIdx = useRef(0)
+  function setTab(t: Tab) {
+    if (tabHistory.current[tabHistoryIdx.current] === t) return
+    tabHistory.current = [...tabHistory.current.slice(0, tabHistoryIdx.current + 1), t]
+    tabHistoryIdx.current = tabHistory.current.length - 1
+    setTabRaw(t)
+  }
+  function goBack() {
+    if (tabHistoryIdx.current <= 0) return
+    tabHistoryIdx.current--
+    setTabRaw(tabHistory.current[tabHistoryIdx.current])
+  }
+  function goForward() {
+    if (tabHistoryIdx.current >= tabHistory.current.length - 1) return
+    tabHistoryIdx.current++
+    setTabRaw(tabHistory.current[tabHistoryIdx.current])
+  }
+  const [, forceNav] = useState(0)
+  function navBack() { goBack(); forceNav(n => n + 1) }
+  function navForward() { goForward(); forceNav(n => n + 1) }
+
+  // undo/redo stack for slot removal
+  const undoStack = useRef<{ date: string; slot: TimeSlot; index: number }[]>([])
+  const redoStack = useRef<{ date: string; slot: TimeSlot; index: number }[]>([])
+  const [undoCount, setUndoCount] = useState(0) // force re-render for disabled state
   const [mapRefreshKey, setMapRefreshKey] = useState(0)
   const [loading, setLoading] = useState(true)
   const [weekLoading, setWeekLoading] = useState(false)
@@ -1163,16 +1371,52 @@ export default function ClientPortal() {
   useEffect(() => {
     const newLevel = getLevelFromScore(score)
     if (prevLevelRef.current > 0 && newLevel > prevLevelRef.current) {
-      setLevelUpMsg(`🎉 Lv.${newLevel} にアップ！`)
+      setLevelUpMsg(`${newLevel}`)
       const t = setTimeout(() => setLevelUpMsg(null), 3500)
+      prevLevelRef.current = newLevel
       return () => clearTimeout(t)
     }
     prevLevelRef.current = newLevel
   }, [score])
 
   const [toggling, setToggling] = useState<string | null>(null)
-  const [weekStartDay, setWeekStartDay] = useState<WeekStart>(1)
+  const [weekStartDay, setWeekStartDay] = useState<WeekStart>(() => {
+    try { const s = parseInt(localStorage.getItem('weekStartDay') ?? '1'); return (s >= 0 && s <= 6 ? s : 1) as WeekStart } catch { return 1 }
+  })
   const [weekOffset, setWeekOffset] = useState(0)
+  const [displayedOffsets, setDisplayedOffsets] = useState<number[]>([0])
+  const [collapsedWeeks, setCollapsedWeeks] = useState<Set<number>>(new Set())
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [collapsedMonths, setCollapsedMonths] = useState<Set<string>>(new Set())
+  const [selectedHistoryMonth, setSelectedHistoryMonth] = useState<string | null>(null)
+  const [selectedYear, setSelectedYear] = useState<number>(() => new Date().getFullYear())
+  const [planVersions, setPlanVersions] = useState<PlanVersion[]>([])
+
+  // planVersionsから月→Planデフォルト内容のマップを事前生成（年ノード単位で解析）
+  const planMonthDefaults = useMemo<Record<string, string>>(() => {
+    const map: Record<string, string> = {}
+    for (const v of planVersions) {
+      for (const yearNode of v.nodes) {
+        // 年ノードのタイトルから西暦を抽出（例: "2026　（残り7年）..."）
+        const yearMatch = yearNode.title.match(/(\d{4})/)
+        if (!yearMatch) continue
+        const year = parseInt(yearMatch[1])
+        // その年ノードの直接子から月ノードを探す
+        for (const child of yearNode.children) {
+          const mMatch = child.title.match(/^(\d+)月/)
+          if (!mMatch) continue
+          const mn = parseInt(mMatch[1])
+          const key = `${year}-${String(mn).padStart(2, '0')}`
+          if (!map[key]) {
+            const lines: string[] = [child.title]
+            child.children.forEach(c => { if (c.title) lines.push(c.title) })
+            map[key] = lines.join('\n')
+          }
+        }
+      }
+    }
+    return map
+  }, [planVersions])
 
   const slotsCache = useRef<Record<number, Record<string, TimeSlot[]>>>({})
   const completionsCache = useRef<Record<number, Record<string, boolean>>>({})
@@ -1192,6 +1436,7 @@ export default function ClientPortal() {
 
   // スロット編集
   const [editingSlotId, setEditingSlotId] = useState<string | null>(null)
+  const [copyingSlotId, setCopyingSlotId] = useState<string | null>(null)
   const [editingSlotDraft, setEditingSlotDraft] = useState<{ time: string; task_id: string; task_name: string; point_value: number }>({ time: '', task_id: '', task_name: '', point_value: 0 })
   const [editSlotSearch, setEditSlotSearch] = useState('')
   const [showEditSlotSearch, setShowEditSlotSearch] = useState(false)
@@ -1200,46 +1445,34 @@ export default function ClientPortal() {
   const [weekGoals, setWeekGoals] = useState<Record<string, string>>({})
   const goalTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
   const [goalChecked, setGoalChecked] = useState<Record<string, boolean>>({})
-  // 今週の目標インライン入力
-  const [weeklyGoalText, setWeeklyGoalText] = useState('')
-  const weeklyGoalTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 週ごとの目標テキスト（week_start → content）
+  const [weeklyGoalTexts, setWeeklyGoalTexts] = useState<Record<string, string>>({})
+  const weeklyGoalTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
+  const carryOverDone = useRef<Set<string>>(new Set())
 
-  // 今週のメモ（週ごとに保存）
-  const [weeklyMemoText, setWeeklyMemoText] = useState('')
-  const weeklyMemoTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 週ごとのメモ（week_start → content）
+  const [weeklyMemoTexts, setWeeklyMemoTexts] = useState<Record<string, string>>({})
+  const weeklyMemoTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
+  const dataRef = useRef<ClientData | null>(null)
 
   const [showLevelBar, setShowLevelBar] = useState(true)
 
-  // 今月のゴール
-  const [monthlyGoalText, setMonthlyGoalText] = useState('')
-  const monthlyGoalTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const monthlyGoalRef = useRef<HTMLDivElement | null>(null)
-  const monthlyGoalExternal = useRef(false)  // 外部からのデータ更新フラグ
-  const [monthGoalColorBar, setMonthGoalColorBar] = useState(false)
+  // 月ごとのゴール（YYYY-MM → content）
+  const [monthlyGoals, setMonthlyGoals] = useState<Record<string, string>>({})
+  const monthlyGoalTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
 
-  // 外部データ更新時だけdivのinnerHTMLを書き換える（ユーザー入力中は触らない）
-  useEffect(() => {
-    if (monthlyGoalExternal.current && monthlyGoalRef.current) {
-      monthlyGoalRef.current.innerHTML = monthlyGoalText
-      monthlyGoalExternal.current = false
-    }
-  }, [monthlyGoalText])
+  // dataRefを常に最新に保つ
+  useEffect(() => { dataRef.current = data }, [data])
 
-  // 週が変わったらweeklyMemo・weeklyGoalを更新
-  useEffect(() => {
-    if (!data) return
-    const ws = (weekDataCache.current[weekOffset]?.week_start) ?? data.week_start
-    const wm = (data.client_goals as any[]).find(g => g.goal_type === 'weekly_memo' && g.period_label === ws)
-    setWeeklyMemoText(wm?.content ?? '')
-    const wg = (data.client_goals as any[]).find(g => g.goal_type === 'weekly' && g.period_label === ws)
-      ?? (weekOffset === 0 ? (data.client_goals as any[]).find(g => g.goal_type === 'weekly' && !g.period_label) : null)
-    setWeeklyGoalText(wg?.content ?? '')
-  }, [weekOffset, data])
+  // (週切り替えuseEffectは無限スクロール方式では不要)
 
 
   // ドラッグ
   const [dragSlotId, setDragSlotId] = useState<string | null>(null)
+  const [dragSlotFromDate, setDragSlotFromDate] = useState<string | null>(null)
+  const [dayDropTarget, setDayDropTarget] = useState<string | null>(null)  // date string being hovered for cross-day copy
   const [slotDropTarget, setSlotDropTarget] = useState<{ id: string; pos: 'before' | 'after' } | null>(null)
+  const [movingSlot, setMovingSlot] = useState<{ slotId: string; fromDate: string; weekDates: string[] } | null>(null)
   const [dragTaskId, setDragTaskId] = useState<string | null>(null)
   const [taskDropTarget, setTaskDropTarget] = useState<{ id: string; pos: 'before' | 'after' } | null>(null)
   const [taskOrder, setTaskOrder] = useState<string[]>(() => {
@@ -1260,6 +1493,7 @@ export default function ClientPortal() {
   // グラフ
   const [chartPeriod, setChartPeriod] = useState<ChartPeriod>('daily')
   const [chartData, setChartData] = useState<{ daily: ChartPoint[]; weekly: ChartPoint[]; monthly: ChartPoint[] } | null>(null)
+  const rawChartData = useRef<{ daily: { date: string; score: number }[]; weekly: { week: string; score: number }[]; monthly: { month: string; score: number }[] } | null>(null)
   const [chartLoading, setChartLoading] = useState(false)
   const [homeGoals, setHomeGoals] = useState<IdealMap | null>(null)
   const [homeGoalDrafts, setHomeGoalDrafts] = useState<Record<string, string>>({})
@@ -1308,7 +1542,7 @@ export default function ClientPortal() {
       : (p === 'daily' ? '前日比' : p === 'weekly' ? '前週比' : '前月比'),
     monthGoalLabel: (m: string) => {
       const mn = parseInt(m.split('-')[1] ?? '1')
-      return lang === 'en' ? `GOALS · ${MONTH_ABBR[mn - 1]}` : `今月のゴール`
+      return lang === 'en' ? `GOALS · ${MONTH_ABBR[mn - 1]}` : `${mn}月のゴール`
     },
     goals: 'GOALS',
     rewards: lang === 'en' ? 'Rewards' : '報酬設定',
@@ -1328,7 +1562,7 @@ export default function ClientPortal() {
       ? (offset === 0 ? 'This Week' : offset === 1 ? 'Next Week' : offset === -1 ? 'Last Week' : offset > 0 ? `+${offset}W` : `${Math.abs(offset)}W ago`)
       : (offset === 0 ? '今週' : offset === 1 ? '来週' : offset === -1 ? '先週' : offset > 0 ? `${offset}週後` : `${Math.abs(offset)}週前`),
     thisWeek: lang === 'en' ? 'This Week' : '今週',
-    weekStart: (s: number) => lang === 'en' ? (s === 1 ? 'Mon' : 'Sun') : (s === 1 ? '月始' : '日始'),
+    weekStart: (s: number) => lang === 'en' ? (s === 1 ? 'Mon' : s === 2 ? 'Tue' : 'Sun') : (s === 1 ? '月始' : s === 2 ? '火始' : '日始'),
     monthGoalPlaceholder: lang === 'en' ? 'Monthly goal...' : '今月達成したいこと...',
     weekGoalPlaceholder: lang === 'en' ? 'Weekly goal...' : '今週の目標...',
     todayGoalPlaceholder: lang === 'en' ? "Today's goal..." : '今日の目標...',
@@ -1351,23 +1585,18 @@ export default function ClientPortal() {
     todayGoalFormPlaceholder: lang === 'en' ? 'What you want to achieve today...' : '今日達成したいこと...',
     resultPlaceholder: lang === 'en' ? 'What you did, results...' : '今日やったこと、結果...',
     causePlaceholder: lang === 'en' ? 'Why you missed it...' : 'なぜ達成できなかったか...',
-    tomorrowPlaceholder: lang === 'en' ? 'What you want to achieve tomorrow...' : '明日達成したいこと...',
+    tomorrowPlaceholder: lang === 'en' ? 'What you will achieve tomorrow...' : '明日達成すること...',
     improvementPlaceholder: lang === 'en' ? 'Improvements, learnings...' : '改善点、気づき、次に活かすこと...',
   }
 
   const memoSaveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
-  const today = localDate(new Date())
+  const today = localDate(getTestToday())
 
   const [reportForm, setReportForm] = useState({
-    report_date: today, today_goal: '', result: '',
-    achieved: null as boolean | null,
-    reason: '', tomorrow_goal: '', memo: '',
+    report_date: today, today_goal: '',
+    score: null as number | null,
+    reason: '', tomorrow_goal: '',
   })
-
-  useEffect(() => {
-    const saved = localStorage.getItem('weekStartDay')
-    if (saved === '0') setWeekStartDay(0)
-  }, [])
 
   const loadWeek = useCallback(async (offset: number, initial = false) => {
     if (!initial) setWeekLoading(true)
@@ -1403,51 +1632,85 @@ export default function ClientPortal() {
       if ((r as any).goal_achieved) checkedMap[r.report_date] = true
     })
 
-    setSlots(slotMap)
-    setCompletions(map)
-    setWeekGoals(goalsMap)
-    setGoalChecked(prev => ({ ...prev, ...checkedMap }))
+    // 現在週のみstateを更新（過去週はcacheのみ・re-render不要）
+    if (offset === 0) {
+      setSlots(prev => ({ ...prev, ...slotMap }))
+      setCompletions(prev => ({ ...prev, ...map }))
+      setWeekGoals(prev => ({ ...prev, ...goalsMap }))
+      setGoalChecked(prev => ({ ...prev, ...checkedMap }))
+    }
 
-    // 週のゴール・メモは毎回（週切替時も）更新
+    // 週のゴール・メモをweek_startキーで保存
     const ws = d.week_start
     const wg = (d.client_goals as any[]).find(g => g.goal_type === 'weekly' && g.period_label === ws)
       ?? (offset === 0 ? (d.client_goals as any[]).find(g => g.goal_type === 'weekly' && !g.period_label) : null)
-    setWeeklyGoalText(wg?.content ?? '')
+    // wgが存在する（DB行あり）場合のみ上書き。存在しない場合はcarry-overで既にセットされた値を保持
+    setWeeklyGoalTexts(prev => ({ ...prev, [ws]: wg != null ? (wg.content ?? '') : (prev[ws] ?? '') }))
     const wm = (d.client_goals as any[]).find(g => g.goal_type === 'weekly_memo' && g.period_label === ws)
-    setWeeklyMemoText(wm?.content ?? '')
+    setWeeklyMemoTexts(prev => ({ ...prev, [ws]: wm != null ? (wm.content ?? '') : (prev[ws] ?? '') }))
+
+    // 月次ゴールを全月分マージ
+    d.client_goals.filter((g: ClientGoal) => g.goal_type === 'monthly' && g.period_label && g.period_label !== 'reward').forEach((g: ClientGoal) => {
+      setMonthlyGoals(prev => ({ ...prev, [g.period_label!]: g.content ?? '' }))
+    })
 
     if (initial) {
       setExpandedDates(new Set([today]))
       const tr = d.daily_reports.find(r => r.report_date === today)
       if (tr) {
-        setReportForm({ report_date: today, today_goal: tr.today_goal ?? '', result: tr.result ?? '', achieved: tr.achieved ?? null, reason: tr.reason ?? '', tomorrow_goal: tr.tomorrow_goal ?? '', memo: '' })
+        setReportForm({ report_date: today, today_goal: tr.today_goal ?? '', score: tr.score != null ? (tr.score === 20 ? 10 : tr.score) : null, reason: tr.reason ?? '', tomorrow_goal: tr.tomorrow_goal ?? '' })
       }
-      const cm = today.slice(0, 7)
-      const mg = d.client_goals.find((g: ClientGoal) => g.goal_type === 'monthly' && g.period_label === cm)
-      monthlyGoalExternal.current = true
-      setMonthlyGoalText(mg?.content ?? '')
     }
     setWeekLoading(false)
     setLoading(false)
   }, [token, weekStartDay, today, router])
 
-  useEffect(() => { loadWeek(0, true) }, [loadWeek])
-
-  // グラフデータ取得 (ホーム表示時)
   useEffect(() => {
-    if (tab !== 'home' || chartData) return
+    loadWeek(0, true)
+    // 今月の残りの週も自動ロード（先週は月跨ぎでも常にロード）
+    const currentM = new Date().toISOString().slice(0, 7)
+    const extraOffsets: number[] = []
+    let o = -1
+    while (getAnchorDate(weekStartDay, o).slice(0, 7) === currentM) {
+      extraOffsets.push(o)
+      o--
+    }
+    // offset -1（先週）は常に含める（先週からのコピー機能のため）
+    if (!extraOffsets.includes(-1)) extraOffsets.push(-1)
+    setDisplayedOffsets([0, ...extraOffsets])
+    extraOffsets.forEach(off => loadWeek(off, false))
+  }, [loadWeek])
+
+  function buildChartData(raw: typeof rawChartData.current, l: 'en' | 'ja') {
+    if (!raw) return null
+    return {
+      daily: raw.daily.map(p => ({ label: p.date.slice(5), score: p.score })),
+      weekly: raw.weekly.map(p => ({ label: p.week.slice(5), score: p.score })),
+      monthly: raw.monthly.map(p => {
+        const mn = parseInt(p.month.slice(5)) - 1
+        return { label: l === 'ja' ? `${mn + 1}月` : (MONTH_ABBR[mn] ?? p.month), score: p.score }
+      }),
+    }
+  }
+
+  // グラフデータ取得 (ホーム表示時) + lang変更時に再計算
+  useEffect(() => {
+    if (tab !== 'home') return
+    if (lang !== 'en' && lang !== 'ja') return
     setChartLoading(true)
-    fetch(`/api/client/${token}/chart`)
+    fetch(`/api/client/${token}/chart?today=${today}`)
       .then(r => r.json())
-      .then(d => {
-        setChartData({
-          daily: d.daily.map((p: { date: string; score: number }) => ({ label: p.date.slice(5), score: p.score })),
-          weekly: d.weekly.map((p: { week: string; score: number }) => ({ label: p.week.slice(5), score: p.score })),
-          monthly: d.monthly.map((p: { month: string; score: number }) => { const mn = parseInt(p.month.slice(5)) - 1; return { label: lang === 'ja' ? `${mn + 1}月` : (MONTH_ABBR[mn] ?? p.month), score: p.score } }),
-        })
-      })
+      .then(d => { rawChartData.current = d; setChartData(buildChartData(d, lang)) })
       .finally(() => setChartLoading(false))
-  }, [tab, token, chartData])
+  }, [tab, token, lang, today])
+
+  // Planバージョン取得（月次ゴール自動反映用）
+  useEffect(() => {
+    fetch(`/api/client/${token}/plan`)
+      .then(r => r.json())
+      .then(d => { if (d.versions) setPlanVersions(d.versions) })
+      .catch(() => {})
+  }, [token])
 
   // 理想マップのゴール取得 (ホームタブ表示のたびに再取得)
   useEffect(() => {
@@ -1462,18 +1725,161 @@ export default function ClientPortal() {
       .catch(() => {})
   }, [tab, token])
 
+  // 今週の目標が未設定なら先週の内容を自動引き継ぎ（1週につき1回のみ）
+  useEffect(() => {
+    if (!data) return
+    const ws = data.week_start
+    if (!ws || carryOverDone.current.has(ws)) return
+    carryOverDone.current.add(ws)
+    ;(async () => {
+      // 今週の目標をAPIで確認
+      const thisWeekRes = await fetch(`/api/client/${token}/weekly-goal?week_start=${ws}`).catch(() => null)
+      if (!thisWeekRes?.ok) return
+      const thisWeekData = await thisWeekRes.json()
+      if (thisWeekData.content) return // 既に設定済み
+      // 前週からcarry-over
+      const prev = new Date(ws + 'T00:00:00')
+      prev.setDate(prev.getDate() - 7)
+      const prevWs = localDate(prev)
+      const prevRes = await fetch(`/api/client/${token}/weekly-goal?week_start=${prevWs}`).catch(() => null)
+      if (!prevRes?.ok) return
+      const prevData = await prevRes.json()
+      if (!prevData.content) return
+      setWeeklyGoalTexts(p => ({ ...p, [ws]: prevData.content }))
+      fetch(`/api/client/${token}/weekly-goal`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: prevData.content, week_start: ws }),
+      }).catch(() => {})
+    })()
+  }, [data, token])
+
+  // 今週のメモが未設定なら先週の内容を自動引き継ぎ（1週につき1回のみ）
+  useEffect(() => {
+    if (!data) return
+    const ws = data.week_start
+    const memoKey = ws + '_memo'
+    if (!ws || carryOverDone.current.has(memoKey)) return
+    carryOverDone.current.add(memoKey)
+    ;(async () => {
+      const thisRes = await fetch(`/api/client/${token}/weekly-memo?week_start=${ws}`).catch(() => null)
+      if (!thisRes?.ok) return
+      const thisData = await thisRes.json()
+      if (thisData.content) return
+      const prev = new Date(ws + 'T00:00:00')
+      prev.setDate(prev.getDate() - 7)
+      const prevWs = localDate(prev)
+      const prevRes = await fetch(`/api/client/${token}/weekly-memo?week_start=${prevWs}`).catch(() => null)
+      if (!prevRes?.ok) return
+      const prevData = await prevRes.json()
+      if (!prevData.content) return
+      setWeeklyMemoTexts(p => ({ ...p, [ws]: prevData.content }))
+      fetch(`/api/client/${token}/weekly-memo`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: prevData.content, week_start: ws }),
+      }).catch(() => {})
+    })()
+  }, [data, token])
+
+  // ドラッグ中に画面端でオートスクロール
+  useEffect(() => {
+    const isDragging = dragSlotId || dragTaskId
+    if (!isDragging) return
+    let rafId: number
+    let lastY = 0
+    const ZONE = 80 // px from edge to trigger scroll
+    const MAX_SPEED = 12
+    const onDragOver = (e: DragEvent) => { lastY = e.clientY }
+    window.addEventListener('dragover', onDragOver)
+    const tick = () => {
+      const vh = window.innerHeight
+      if (lastY < ZONE) {
+        window.scrollBy(0, -MAX_SPEED * (1 - lastY / ZONE))
+      } else if (lastY > vh - ZONE) {
+        window.scrollBy(0, MAX_SPEED * (1 - (vh - lastY) / ZONE))
+      }
+      rafId = requestAnimationFrame(tick)
+    }
+    rafId = requestAnimationFrame(tick)
+    return () => { window.removeEventListener('dragover', onDragOver); cancelAnimationFrame(rafId) }
+  }, [dragSlotId, dragTaskId])
+
   async function switchWeek(offset: number) {
     setWeekOffset(offset); setExpandedDates(new Set()); setShowSearch(null)
     if (slotsCache.current[offset]) {
-      setSlots(slotsCache.current[offset])
-      setCompletions(completionsCache.current[offset] ?? {})
+      setSlots(prev => ({ ...prev, ...slotsCache.current[offset] }))
+      setCompletions(prev => ({ ...prev, ...(completionsCache.current[offset] ?? {}) }))
       const cached = weekDataCache.current[offset]
       if (cached) {
         const goalsMap: Record<string, string> = {}
         cached.daily_reports.forEach(r => { if (r.today_goal) goalsMap[r.report_date] = r.today_goal })
-        setWeekGoals(goalsMap)
+        setWeekGoals(prev => ({ ...prev, ...goalsMap }))
       }
     } else { await loadWeek(offset) }
+  }
+
+  function dateToOffset(date: string): number {
+    for (const [off, data] of Object.entries(weekDataCache.current)) {
+      if (getWeekDates(data.week_start).includes(date)) return parseInt(off)
+    }
+    return 0
+  }
+
+  async function loadMore() {
+    const minOffset = Math.min(...displayedOffsets)
+    const searchOffset = minOffset - 1
+    const targetMonth = getAnchorDate(weekStartDay, searchOffset).slice(0, 7)
+    const offsetsToLoad: number[] = []
+    let o = searchOffset
+    while (getAnchorDate(weekStartDay, o).slice(0, 7) === targetMonth) {
+      offsetsToLoad.push(o)
+      o--
+    }
+    setLoadingMore(true)
+    await Promise.all(offsetsToLoad.map(off => loadWeek(off, false)))
+    setDisplayedOffsets(prev => Array.from(new Set([...prev, ...offsetsToLoad])))
+    setCollapsedMonths(cm => { const n = new Set(cm); n.delete(targetMonth); return n })
+    // 過去月の週はデフォルト折りたたみ
+    setCollapsedWeeks(cw => { const n = new Set(cw); offsetsToLoad.forEach(o => { if (o !== 0) n.add(o) }); return n })
+    setLoadingMore(false)
+  }
+
+  async function jumpToWeek(n: number) {
+    const offset = -n
+    const toLoad: number[] = []
+    const minLoaded = Math.min(...displayedOffsets)
+    for (let o = minLoaded - 1; o >= offset; o--) toLoad.push(o)
+    if (toLoad.length > 0) {
+      setLoadingMore(true)
+      await Promise.all(toLoad.map(o => loadWeek(o, false)))
+      setDisplayedOffsets(prev => Array.from(new Set([...prev, ...toLoad])))
+      setLoadingMore(false)
+    }
+    setTimeout(() => {
+      document.getElementById(`week-card-${Math.abs(offset)}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }, 150)
+  }
+
+  async function handleSelectMonth(yearMonth: string) {
+    setSelectedHistoryMonth(prev => prev === yearMonth ? null : yearMonth)
+    setLoadingMore(true)
+    const toLoad: number[] = []
+    const [y, m] = yearMonth.split('-').map(Number)
+    const midMonth = new Date(y, m - 1, 15)
+    const anchor = new Date((data?.week_start ?? today) + 'T00:00:00')
+    const approxOffset = -Math.round((anchor.getTime() - midMonth.getTime()) / (7 * 24 * 60 * 60 * 1000))
+    // 対象月の日付を含む全週をロード（月をまたぐ週も含む）
+    for (let o = approxOffset + 5; o >= approxOffset - 7; o--) {
+      if (o === 0) continue
+      const ws = getAnchorDate(weekStartDay, o)
+      const hasInMonth = ws.startsWith(yearMonth) || getWeekDates(ws).some(d => d.startsWith(yearMonth))
+      if (hasInMonth && !weekDataCache.current[o]) toLoad.push(o)
+    }
+    if (toLoad.length > 0) {
+      await Promise.all(toLoad.map(o => loadWeek(o, false)))
+      setDisplayedOffsets(prev => Array.from(new Set([...prev, ...toLoad])))
+      setCollapsedWeeks(cw => { const n = new Set(cw); toLoad.forEach(o => n.add(o)); return n })
+    }
+    setLoadingMore(false)
   }
 
   function flash(m: string) { setMsg(m); setTimeout(() => setMsg(''), 2500) }
@@ -1497,7 +1903,7 @@ export default function ClientPortal() {
     if (targetIdx === -1) return
     arr.splice(before ? targetIdx : targetIdx + 1, 0, dragged)
     setSlots(s => ({ ...s, [date]: arr }))
-    slotsCache.current[weekOffset] = { ...(slotsCache.current[weekOffset] ?? {}), [date]: arr }
+    const _off1 = dateToOffset(date); slotsCache.current[_off1] = { ...(slotsCache.current[_off1] ?? {}), [date]: arr }
     saveSlots(date, arr)
   }
 
@@ -1523,11 +1929,11 @@ export default function ClientPortal() {
 
   function commitQuickAdd(date: string) {
     const q = quickAdd[date]
-    if (!q?.task_id || !q?.time) return
+    if (!q?.task_id) return
     const slot: TimeSlot = { id: genId(), time: q.time, task_id: q.task_id, task_name: q.task_name, point_value: q.point_value, task_memo: q.task_memo }
     const updated = [...(slots[date] ?? []), slot]
     setSlots(s => ({ ...s, [date]: updated }))
-    slotsCache.current[weekOffset] = { ...(slotsCache.current[weekOffset] ?? {}), [date]: updated }
+    const _off2 = dateToOffset(date); slotsCache.current[_off2] = { ...(slotsCache.current[_off2] ?? {}), [date]: updated }
     saveSlots(date, updated)
     setQuickAdd(q2 => ({ ...q2, [date]: { time: '', search: '', task_id: '', task_name: '', point_value: 0 } }))
     setShowSearch(null)
@@ -1562,7 +1968,7 @@ export default function ClientPortal() {
       s.id === editingSlotId ? { ...s, ...editingSlotDraft } : s
     )
     setSlots(s => ({ ...s, [date]: updated }))
-    slotsCache.current[weekOffset] = { ...(slotsCache.current[weekOffset] ?? {}), [date]: updated }
+    const _offX = dateToOffset(date); slotsCache.current[_offX] = { ...(slotsCache.current[_offX] ?? {}), [date]: updated }
     saveSlots(date, updated)
     // task_id が紐づくclient_goalsも更新する
     if (editingSlotDraft.task_id) {
@@ -1583,15 +1989,47 @@ export default function ClientPortal() {
   }
 
   function removeSlot(date: string, slotId: string) {
-    const updated = (slots[date] ?? []).filter(s => s.id !== slotId)
+    const arr = slots[date] ?? []
+    const idx = arr.findIndex(s => s.id === slotId)
+    if (idx === -1) return
+    undoStack.current.push({ date, slot: arr[idx], index: idx })
+    redoStack.current = []
+    setUndoCount(n => n + 1)
+    const updated = arr.filter(s => s.id !== slotId)
     setSlots(s => ({ ...s, [date]: updated }))
-    slotsCache.current[weekOffset] = { ...(slotsCache.current[weekOffset] ?? {}), [date]: updated }
+    const _offX = dateToOffset(date); slotsCache.current[_offX] = { ...(slotsCache.current[_offX] ?? {}), [date]: updated }
     saveSlots(date, updated)
+  }
+
+  function undoRemoveSlot() {
+    const item = undoStack.current.pop()
+    if (!item) return
+    redoStack.current.push(item)
+    setUndoCount(n => n + 1)
+    setSlots(prev => {
+      const arr = [...(prev[item.date] ?? [])]
+      arr.splice(item.index, 0, item.slot)
+      const _offX = dateToOffset(item.date); slotsCache.current[_offX] = { ...(slotsCache.current[_offX] ?? {}), [item.date]: arr }
+      saveSlots(item.date, arr)
+      return { ...prev, [item.date]: arr }
+    })
+  }
+
+  function redoRemoveSlot() {
+    const item = redoStack.current.pop()
+    if (!item) return
+    undoStack.current.push(item)
+    setUndoCount(n => n + 1)
+    setSlots(prev => {
+      const arr = (prev[item.date] ?? []).filter(s => s.id !== item.slot.id)
+      const _offX = dateToOffset(item.date); slotsCache.current[_offX] = { ...(slotsCache.current[_offX] ?? {}), [item.date]: arr }
+      saveSlots(item.date, arr)
+      return { ...prev, [item.date]: arr }
+    })
   }
 
   async function toggleTask(taskId: string, slotId: string, date: string, pointValue: number) {
     const key = ck(slotId, date)
-    if (toggling === key) return
     const newVal = !completions[key]
     setCompletions(c => ({ ...c, [key]: newVal }))
     setScore(s => Math.max(0, newVal ? s + pointValue : s - pointValue))
@@ -1623,7 +2061,17 @@ export default function ClientPortal() {
   }
 
   function saveGoal(date: string, value: string) {
+    // 既存データがあるのに空で上書きしようとしている場合は絶対にスキップ
+    const currentVal = weekGoals[date] ?? ''
+    if (value === '' && currentVal !== '') return
     setWeekGoals(g => ({ ...g, [date]: value }))
+    // キャッシュも更新
+    const cached = weekDataCache.current[dateToOffset(date)]
+    if (cached) {
+      const existing = cached.daily_reports.find(r => r.report_date === date)
+      if (existing) { (existing as any).today_goal = value }
+      else { cached.daily_reports.push({ report_date: date, today_goal: value } as DailyReport) }
+    }
     if (goalTimers.current[date]) clearTimeout(goalTimers.current[date])
     goalTimers.current[date] = setTimeout(() => {
       fetch(`/api/client/${token}/report`, {
@@ -1647,7 +2095,7 @@ export default function ClientPortal() {
       // data.client_goalsに新タスクを即追加
       setData(prev => prev ? { ...prev, client_goals: [...prev.client_goals, created] } : prev)
       // スロットも再取得
-      await loadWeek(weekOffset, false)
+      await loadWeek(dateToOffset(date), false)
       // 作成したタスクをそのままクイック追加に乗せる
       const q = quickAdd[date] ?? { time: '', search: '', task_id: '', task_name: '', point_value: 0 }
       setQuickAdd(qa => ({ ...qa, [date]: { ...q, task_id: taskId, task_name: inlineTask.content, point_value: inlineTask.point_value, search: '' } }))
@@ -1665,7 +2113,7 @@ export default function ClientPortal() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newTask),
     })
-    if (res.ok) { setNewTask({ content: '', point_value: 10 }); flash('タスクを追加しました ✓'); loadWeek(weekOffset, true) }
+    if (res.ok) { setNewTask({ content: '', point_value: 10 }); flash('タスクを追加しました ✓'); loadWeek(0, true) }
     else { flash('エラーが発生しました') }
     setAddingTask(false)
   }
@@ -1728,10 +2176,19 @@ export default function ClientPortal() {
     flash('タスクを更新しました ✓')
   }
 
+  function copySingleSlot(slot: TimeSlot, toDate: string) {
+    const newSlot = { ...slot, id: genId() }
+    const merged = [...(slots[toDate] ?? []), newSlot]
+    setSlots(s => ({ ...s, [toDate]: merged }))
+    const _offC = dateToOffset(toDate); slotsCache.current[_offC] = { ...(slotsCache.current[_offC] ?? {}), [toDate]: merged }
+    saveSlots(toDate, merged)
+    setCopyingSlotId(null)
+  }
+
   function updateSlotMemo(date: string, slotId: string, memo: string) {
     const updated = (slots[date] ?? []).map(s => s.id === slotId ? { ...s, task_memo: memo } : s)
     setSlots(s => ({ ...s, [date]: updated }))
-    slotsCache.current[weekOffset] = { ...(slotsCache.current[weekOffset] ?? {}), [date]: updated }
+    const _offX = dateToOffset(date); slotsCache.current[_offX] = { ...(slotsCache.current[_offX] ?? {}), [date]: updated }
     saveSlots(date, updated)
   }
 
@@ -1749,7 +2206,7 @@ export default function ClientPortal() {
   if (loading) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center gap-3 theme-bg">
-        <div className="text-2xl font-bold tracking-widest gold-gradient">ZYVOX</div>
+        <div className="text-2xl font-bold tracking-widest gold-gradient">Leveling</div>
         <div className="text-slate-500 text-sm">読み込み中...</div>
       </div>
     )
@@ -1774,9 +2231,9 @@ export default function ClientPortal() {
   const weekStart = currentWeekData?.week_start ?? data.week_start
   const weekDates = getWeekDates(weekStart)
 
-  const dayLabels = weekStartDay === 1
-    ? (lang === 'en' ? DAY_LABELS_MON_EN : DAY_LABELS_MON_JA)
-    : (lang === 'en' ? DAY_LABELS_SUN_EN : DAY_LABELS_SUN_JA)
+  const ALL_DAYS_JA = ['日', '月', '火', '水', '木', '金', '土']
+  const ALL_DAYS_EN = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+  const dayLabels = Array.from({ length: 7 }, (_, i) => (lang === 'en' ? ALL_DAYS_EN : ALL_DAYS_JA)[(weekStartDay + i) % 7])
 
   const todayReport = (weekDataCache.current[0]?.daily_reports ?? data.daily_reports).find(r => r.report_date === today)
   const latestFb = data.daily_reports.find(r => r.coach_fb || r.coach_ff)
@@ -1799,21 +2256,356 @@ export default function ClientPortal() {
     { id: 'plan', icon: '▦', label: 'Plan' },
     { id: 'map', icon: '◈', label: 'Map' },
     { id: 'reward', icon: '🏆', label: 'Reward' },
-    { id: 'history', icon: '◷', label: 'History' },
   ]
+
+  const renderDayRow = (date: string, dayLabelIdx: number, isCurrentWeek: boolean, cacheOffset?: number) => {
+    const isToday = date === today
+    const isFuture = date > today
+    const isExpanded = expandedDates.has(date)
+    // 過去週はcacheから直接読む（state更新なし→re-renderなし）
+    const _slots = (cacheOffset !== undefined && cacheOffset !== 0) ? (slotsCache.current[cacheOffset] ?? {}) : slots
+    const _completions = (cacheOffset !== undefined && cacheOffset !== 0) ? (completionsCache.current[cacheOffset] ?? {}) : completions
+    const _todayGoal = (cacheOffset !== undefined && cacheOffset !== 0)
+      ? (weekDataCache.current[cacheOffset]?.daily_reports.find(r => r.report_date === date)?.today_goal ?? '')
+      : (weekGoals[date] ?? '')
+    const daySlots = _slots[date] ?? []
+    const donePts = daySlots.filter(s => _completions[ck(s.id, date)]).reduce((sum, s) => sum + s.point_value, 0)
+    const doneCount = daySlots.filter(s => _completions[ck(s.id, date)]).length
+    const d = new Date(date)
+    const q = quickAdd[date] ?? { time: '', search: '', task_id: '', task_name: '', point_value: 0 }
+    const filteredForDate = getOrderedTasks().filter(t => q.search === '' || t.content.toLowerCase().includes(q.search.toLowerCase()))
+    return (
+      <div key={date}>
+        <div
+          className={`flex items-center gap-1.5 px-2 py-1.5 transition-colors hover:bg-slate-800/30 ${isToday ? 'bg-gold-500/5' : ''} ${dayDropTarget === date ? 'bg-gold-500/10 ring-1 ring-inset ring-gold-500/40' : ''}`}
+          onDragOver={e => { if (dragSlotId && dragSlotFromDate && dragSlotFromDate !== date) { e.preventDefault(); setDayDropTarget(date) } }}
+          onDragLeave={e => { if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) setDayDropTarget(null) }}
+          onDrop={e => {
+            e.preventDefault()
+            if (!dragSlotId || !dragSlotFromDate || dragSlotFromDate === date) return
+            const srcSlot = (slots[dragSlotFromDate] ?? []).find(s => s.id === dragSlotId)
+            if (srcSlot) copySingleSlot(srcSlot, date)
+            setDragSlotId(null); setDragSlotFromDate(null); setDayDropTarget(null)
+          }}
+        >
+          <button
+            onClick={() => setExpandedDates(prev => { const s = new Set(prev); isExpanded ? s.delete(date) : s.add(date); return s })}
+            className="flex items-center gap-1 shrink-0"
+          >
+            <span className={`text-xs font-bold w-6 ${isToday ? 'text-gold-400' : isFuture && isCurrentWeek ? 'text-slate-500' : 'text-slate-300'}`}>{dayLabels[dayLabelIdx]}</span>
+            <span className={`text-xs w-4 shrink-0 ${isToday ? 'text-gold-400' : 'text-slate-600'}`}>{d.getDate()}</span>
+          </button>
+          <div className="relative flex-1 min-w-0 overflow-hidden">
+            <RichEditor
+              value={_todayGoal}
+              onChange={v => saveGoal(date, v)}
+              onClick={e => e.stopPropagation()}
+              placeholder={T.todayGoalPlaceholder}
+              className={`w-full text-xs ${isToday ? 'text-white font-semibold' : 'text-slate-500'} ${goalChecked[date] ? 'opacity-50' : ''}`}
+            />
+            {goalChecked[date] && (
+              <div className="absolute inset-y-0 left-0 right-0 flex items-center pointer-events-none">
+                <div className="w-full border-t border-slate-500" />
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            {_todayGoal && (
+              <button
+                onClick={e => { e.stopPropagation(); toggleGoalCheck(date) }}
+                className={`w-4 h-4 rounded-full border flex items-center justify-center text-[8px] font-bold transition-all ${goalChecked[date] ? 'bg-gold-500 border-gold-400 text-navy-950' : 'border-slate-700 text-slate-700'}`}
+              >{goalChecked[date] ? '✓' : ''}</button>
+            )}
+            {daySlots.length > 0 && (() => {
+              const totalPts = daySlots.reduce((s, sl) => s + sl.point_value, 0)
+              return doneCount === daySlots.length
+                ? <span className="text-[10px] text-gold-400 font-semibold">+{donePts}</span>
+                : <span className="text-[10px] text-slate-500">{donePts}/{totalPts}</span>
+            })()}
+            <button
+              onClick={() => setExpandedDates(prev => { const s = new Set(prev); isExpanded ? s.delete(date) : s.add(date); return s })}
+              className={`text-slate-700 text-[10px] transition-transform inline-block ${isExpanded ? 'rotate-180' : ''}`}>▾</button>
+          </div>
+        </div>
+        {isExpanded && (
+          <div className="theme-bg-sub px-3 pt-1.5 pb-2 space-y-0.5" onClick={e => e.stopPropagation()}>
+            {daySlots.map(slot => {
+              const done = !!_completions[ck(slot.id, date)]
+              const isLoad = toggling === ck(slot.id, date)
+              const isEditing = editingSlotId === slot.id
+              const filteredEdit = tasks.filter(t => editSlotSearch === '' || t.content.toLowerCase().includes(editSlotSearch.toLowerCase()))
+              if (isEditing) {
+                return (
+                  <div key={slot.id} className="rounded-lg border border-gold-500/30 bg-slate-800/50 px-2 py-1.5 space-y-1.5">
+                    <div className="flex gap-1.5">
+                      <input type="text" value={editingSlotDraft.time}
+                        onChange={e => setEditingSlotDraft(d => ({ ...d, time: e.target.value }))}
+                        onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) commitEditSlot(date) }}
+                        className="input-dark w-20 shrink-0 px-2 py-1 rounded-lg text-xs font-mono text-center" placeholder="8-10" />
+                      <div className="flex-1 relative">
+                        <input type="text" value={editingSlotDraft.task_name || editSlotSearch}
+                          onChange={e => { setEditSlotSearch(e.target.value); setEditingSlotDraft(d => ({ ...d, task_name: e.target.value })); setShowEditSlotSearch(true) }}
+                          onFocus={() => { setShowEditSlotSearch(true) }}
+                          onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { setShowEditSlotSearch(false); commitEditSlot(date) } }}
+                          className="input-dark w-full px-2 py-1 rounded-lg text-xs text-slate-200" placeholder={T.searchTask} />
+                        {showEditSlotSearch && (
+                          <div className="absolute bottom-full left-0 right-0 mb-1 z-50 max-h-[50vh] overflow-y-auto rounded-xl border border-slate-700 theme-bg shadow-xl divide-y divide-slate-800/50">
+                            {filteredEdit.map(t => (
+                              <button key={t.id} onMouseDown={e => { e.preventDefault(); setEditingSlotDraft(d => ({ ...d, task_id: t.id, task_name: t.content, point_value: t.point_value })); setEditSlotSearch(''); setShowEditSlotSearch(false) }}
+                                className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-slate-700/30">
+                                <span className="text-xs text-slate-300 truncate">{t.content}</span>
+                                <span className="text-[10px] text-gold-400/70 shrink-0">+{t.point_value}pt</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <input type="number" min={1} value={editingSlotDraft.point_value}
+                        onChange={e => setEditingSlotDraft(d => ({ ...d, point_value: parseInt(e.target.value) || 1 }))}
+                        className="input-dark w-14 shrink-0 px-2 py-1 rounded-lg text-xs text-center" />
+                      <span className="text-[10px] text-slate-500 shrink-0">pt</span>
+                      <div className="flex gap-1 flex-wrap">
+                        {[1,2,3,5,10,20,30,40,50,80,100].map(pt => (
+                          <button key={pt} type="button" onClick={() => setEditingSlotDraft(d => ({ ...d, point_value: pt }))}
+                            className={`px-1.5 py-0.5 rounded text-[10px] border ${editingSlotDraft.point_value === pt ? 'bg-gold-500/20 border-gold-500/50 text-gold-400' : 'border-slate-700 text-slate-500'}`}>{pt}</button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="flex gap-1.5">
+                      <button onClick={() => setEditingSlotId(null)} className="flex-1 py-1 rounded-lg text-[10px] text-slate-500 border border-slate-700">{T.cancel}</button>
+                      <button onClick={() => commitEditSlot(date)} className="flex-1 py-1 rounded-lg text-[10px] btn-gold font-bold">{T.save}</button>
+                    </div>
+                  </div>
+                )
+              }
+              const slotDropHere = slotDropTarget?.id === slot.id ? slotDropTarget.pos : null
+              return (
+                <div key={slot.id} data-drag-id={slot.id}
+                  onDragOver={e => { if (dragSlotId === slot.id) return; e.preventDefault(); e.stopPropagation(); const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); setSlotDropTarget({ id: slot.id, pos: e.clientY < r.top + r.height / 2 ? 'before' : 'after' }) }}
+                  onDragLeave={() => setSlotDropTarget(null)}
+                  onDrop={e => { e.preventDefault(); e.stopPropagation(); if (dragSlotId && slotDropHere) { reorderSlotArray(date, dragSlotId, slot.id, slotDropHere === 'before'); setDragSlotId(null); setSlotDropTarget(null) } }}
+                  onDragEnd={() => { setDragSlotId(null); setSlotDropTarget(null) }}
+                  className={`relative flex items-center gap-1.5 rounded-lg px-2 py-0.5 border transition-colors ${done ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-slate-800/30 border-slate-700/30'} ${dragSlotId === slot.id ? 'opacity-40' : ''}`}
+                >
+                  {slotDropHere === 'before' && <div className="absolute top-0 left-0 right-0 h-0.5 bg-gold-400 pointer-events-none rounded" />}
+                  {slotDropHere === 'after' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gold-400 pointer-events-none rounded" />}
+                  <span draggable onDragStart={e => { e.stopPropagation(); setDragSlotId(slot.id); setDragSlotFromDate(date) }}
+                    onDragEnd={() => { setDragSlotId(null); setDragSlotFromDate(null); setDayDropTarget(null) }}
+                    className="text-slate-500 text-sm cursor-grab active:cursor-grabbing shrink-0 select-none leading-none"
+                    {...makeTouchHandlers(slot.id, setDragSlotId, setSlotDropTarget, (from, to, before) => reorderSlotArray(date, from, to, before))}>⠿</span>
+                  <button onClick={() => toggleTask(slot.task_id, slot.id, date, slot.point_value)}
+                    className={`w-5 h-5 rounded-md border flex items-center justify-center shrink-0 transition-all active:scale-90 disabled:opacity-40 ${done ? 'bg-emerald-500 border-emerald-500' : 'border-slate-600'}`}>
+                    {isLoad ? <span className="text-[6px] text-slate-500">…</span> : done ? <span className="text-white text-[8px] font-bold">✓</span> : null}
+                  </button>
+                  <button onClick={() => startEditSlot(slot)} className={`text-[10px] font-mono shrink-0 min-w-[32px] text-left hover:text-gold-400 transition-colors ${done ? 'text-emerald-400/50' : 'text-slate-500'}`}>{slot.time || '—'}</button>
+                  <button onClick={() => startEditSlot(slot)} className="shrink-0 text-xs text-left">
+                    <span className={done ? 'line-through text-slate-500' : 'text-slate-200'}>{data.client_goals.find(g => g.id === slot.task_id)?.content ?? slot.task_name}</span>
+                  </button>
+                  <input type="text" value={slotMemos[slot.id] !== undefined ? slotMemos[slot.id] : (slot.task_memo ?? '')}
+                    onChange={e => setSlotMemos(m => ({ ...m, [slot.id]: e.target.value }))}
+                    onBlur={e => updateSlotMemo(date, slot.id, e.target.value)}
+                    onClick={e => e.stopPropagation()}
+                    className="flex-1 min-w-0 bg-transparent border-none outline-none text-[10px] text-slate-500 placeholder-slate-700"
+                    placeholder={T.memoPlaceholder} />
+                  <span className="text-[10px] text-gold-400/60 shrink-0">+{slot.point_value}</span>
+                  <button onClick={e => { e.stopPropagation(); const off = dateToOffset(date); const ws = weekDataCache.current[off]?.week_start ?? data.week_start; setMovingSlot({ slotId: slot.id, fromDate: date, weekDates: getWeekDates(ws) }) }} className="text-slate-700 hover:text-blue-400 text-[10px] shrink-0 w-5 h-5 flex items-center justify-center transition-colors" title="別の日に移動">↗</button>
+                  <button onClick={() => removeSlot(date, slot.id)} className="text-slate-700 hover:text-red-400 text-[10px] shrink-0 w-5 h-5 flex items-center justify-center transition-colors">✕</button>
+                </div>
+              )
+            })}
+            <div className="relative flex gap-1.5 mt-1">
+              <input type="text" value={q.time}
+                onChange={e => setQuickAdd(qa => ({ ...qa, [date]: { ...q, time: e.target.value } }))}
+                onKeyDown={e => { if (e.key === 'Enter') commitQuickAdd(date) }}
+                className="input-dark w-20 shrink-0 px-2 py-2 rounded-lg text-xs font-mono text-center" placeholder="8-10" />
+              <div className="flex-1 relative">
+                <input type="text"
+                  value={q.task_id ? q.task_name : q.search}
+                  onChange={e => { setQuickAdd(qa => ({ ...qa, [date]: { ...q, search: e.target.value, task_id: '', task_name: '', point_value: 0 } })); setShowSearch(date) }}
+                  onFocus={() => setShowSearch(date)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                      if (q.task_id) { commitQuickAdd(date) }
+                      else if (filteredForDate.length === 1) {
+                        const t = filteredForDate[0]
+                        const slot: TimeSlot = { id: genId(), time: q.time, task_id: t.id, task_name: t.content, point_value: t.point_value, task_memo: '' }
+                        const updated = [...(slots[date] ?? []), slot]
+                        setSlots(s => ({ ...s, [date]: updated }))
+                        const _off2 = dateToOffset(date); slotsCache.current[_off2] = { ...(slotsCache.current[_off2] ?? {}), [date]: updated }
+                        saveSlots(date, updated)
+                        setQuickAdd(qa => ({ ...qa, [date]: { time: '', search: '', task_id: '', task_name: '', point_value: 0 } }))
+                        setShowSearch(null)
+                      }
+                    }
+                  }}
+                  onDoubleClick={() => { if (q.task_id) commitQuickAdd(date) }}
+                  className={`input-dark w-full px-2 py-2 rounded-lg text-xs ${q.task_id ? 'text-gold-400' : 'text-slate-300'}`}
+                  placeholder={tasks.length === 0 ? T.noTaskYet : T.searchTask}
+                  readOnly={!!q.task_id} />
+                {q.task_id && (
+                  <button onClick={() => setQuickAdd(qa => ({ ...qa, [date]: { ...q, task_id: '', task_name: '', point_value: 0, search: '' } }))}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-600 hover:text-slate-400 text-[10px]">✕</button>
+                )}
+                {showSearch === date && !q.task_id && (
+                  <div className="absolute bottom-full left-0 right-0 mb-1 z-50 max-h-[50vh] overflow-y-auto rounded-xl border border-slate-700 theme-bg shadow-xl divide-y divide-slate-800/50">
+                    {filteredForDate.map(t => (
+                      <div key={t.id} className="divide-y divide-slate-800/30">
+                        {editingTaskId === t.id ? (
+                          <div className="px-3 py-2 space-y-1.5 bg-slate-800/60" onMouseDown={e => e.preventDefault()}>
+                            <input type="text" value={editingTaskDraft.content}
+                              onChange={e => setEditingTaskDraft(d => ({ ...d, content: e.target.value }))}
+                              className="input-dark w-full px-2 py-1 rounded-lg text-xs" placeholder="タスク名" autoFocus />
+                            <div className="flex items-center gap-1.5">
+                              <input type="number" min={1} value={editingTaskDraft.point_value}
+                                onChange={e => setEditingTaskDraft(d => ({ ...d, point_value: parseInt(e.target.value) || 1 }))}
+                                className="input-dark w-14 px-2 py-1 rounded-lg text-xs text-center" />
+                              <span className="text-[10px] text-slate-500 shrink-0">pt</span>
+                              <div className="flex gap-1 flex-wrap">
+                                {[1,2,3,5,10,20,30,40,50,80,100].map(pt => (
+                                  <button key={pt} type="button" onMouseDown={e => { e.preventDefault(); setEditingTaskDraft(d => ({ ...d, point_value: pt })) }}
+                                    className={`px-1.5 py-0.5 rounded text-[10px] border ${editingTaskDraft.point_value === pt ? 'bg-gold-500/20 border-gold-500/50 text-gold-400' : 'border-slate-700 text-slate-500'}`}>{pt}</button>
+                                ))}
+                              </div>
+                            </div>
+                            <div className="flex gap-1.5">
+                              <button onMouseDown={e => { e.preventDefault(); setEditingTaskId(null) }} className="flex-1 py-1 rounded-lg text-[10px] border border-slate-700 text-slate-500">{T.cancel}</button>
+                              <button onMouseDown={e => { e.preventDefault(); commitEditTask() }} disabled={savingTaskEdit || !editingTaskDraft.content.trim()}
+                                className="flex-1 py-1 rounded-lg text-[10px] btn-gold font-bold disabled:opacity-40">{savingTaskEdit ? '...' : T.save}</button>
+                            </div>
+                          </div>
+                        ) : (() => {
+                          const taskDropHere = taskDropTarget?.id === t.id ? taskDropTarget.pos : null
+                          return (
+                            <div data-drag-id={`task_${t.id}`}
+                              className={`relative flex items-center hover:bg-slate-700/30 transition-colors group ${dragTaskId === t.id ? 'opacity-40' : ''}`}
+                              onDragOver={e => { if (dragTaskId === t.id) return; e.preventDefault(); e.stopPropagation(); const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); setTaskDropTarget({ id: t.id, pos: e.clientY < r.top + r.height / 2 ? 'before' : 'after' }) }}
+                              onDragLeave={() => setTaskDropTarget(null)}
+                              onDrop={e => { e.preventDefault(); e.stopPropagation(); if (dragTaskId && taskDropHere) { reorderTasks(dragTaskId, t.id, taskDropHere === 'before'); setDragTaskId(null); setTaskDropTarget(null) } }}
+                              onDragEnd={() => { setDragTaskId(null); setTaskDropTarget(null) }}
+                            >
+                              {taskDropHere === 'before' && <div className="absolute top-0 left-0 right-0 h-0.5 bg-gold-400 pointer-events-none" />}
+                              {taskDropHere === 'after' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gold-400 pointer-events-none" />}
+                              <span draggable onDragStart={e => { e.stopPropagation(); setDragTaskId(t.id) }} onMouseDown={e => e.preventDefault()} className="pl-2 text-slate-600 hover:text-slate-400 text-sm cursor-grab active:cursor-grabbing shrink-0 select-none leading-none"
+                                {...makeTouchHandlers(`task_${t.id}`, (id) => setDragTaskId(id ? id.replace('task_','') : null), (tgt) => setTaskDropTarget(tgt ? { id: tgt.id.replace('task_',''), pos: tgt.pos } : null), (from, to, before) => reorderTasks(from.replace('task_',''), to.replace('task_',''), before), 'data-drag-id')}>⠿</span>
+                              <button
+                                onMouseDown={e => { e.preventDefault(); setQuickAdd(qa => ({ ...qa, [date]: { ...q, task_id: t.id, task_name: t.content, point_value: t.point_value, task_memo: '', search: '' } })); setShowSearch(null) }}
+                                onDoubleClick={e => { e.preventDefault(); setQuickAdd(qa => ({ ...qa, [date]: { ...q, task_id: t.id, task_name: t.content, point_value: t.point_value, task_memo: '', search: '' } })); setShowSearch(null); setTimeout(() => commitQuickAdd(date), 0) }}
+                                className="flex-1 text-left px-3 py-2 min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs text-slate-300 truncate">{t.content}</span>
+                                  <span className="text-[10px] text-gold-400/70 shrink-0">+{t.point_value}pt</span>
+                                </div>
+                              </button>
+                              <button onMouseDown={e => { e.preventDefault(); startEditTask(t) }}
+                                className="px-2 py-2 text-slate-600 hover:text-gold-400 text-[10px] opacity-0 group-hover:opacity-100 transition-all shrink-0">✎</button>
+                              <button onMouseDown={e => { e.preventDefault(); deleteTask(t.id) }}
+                                className="px-2 py-2 text-slate-700 hover:text-red-400 text-[10px] opacity-0 group-hover:opacity-100 transition-all shrink-0">✕</button>
+                            </div>
+                          )
+                        })()}
+                      </div>
+                    ))}
+                    <button
+                      onMouseDown={e => {
+                        e.preventDefault()
+                        setShowNewTaskFor(date)
+                        setShowSearch(null)
+                        setTimeout(() => { document.getElementById(`new-task-form-${date}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }) }, 100)
+                      }}
+                      className="w-full text-left px-3 py-2.5 flex items-center gap-2 hover:bg-gold-500/10 transition-colors">
+                      <span className="text-[10px] text-gold-400 font-bold">＋ 新しいタスクを作る</span>
+                      {q.search && <span className="text-[10px] text-slate-500">「{q.search}」</span>}
+                    </button>
+                  </div>
+                )}
+              </div>
+              <button onClick={() => commitQuickAdd(date)} disabled={!q.task_id}
+                className="shrink-0 w-9 h-[34px] rounded-lg btn-gold flex items-center justify-center text-sm font-bold disabled:opacity-30 disabled:cursor-not-allowed">+</button>
+            </div>
+            {showNewTaskFor === date && (
+              <div id={`new-task-form-${date}`} className="bg-slate-800/50 rounded-xl p-3 space-y-2 border border-slate-700/50" onClick={e => e.stopPropagation()}>
+                <div className="text-[9px] text-gold-400 font-bold uppercase tracking-wider">{T.addNewTask}</div>
+                <input type="text" value={inlineTask.content}
+                  onChange={e => setInlineTask(t => ({ ...t, content: e.target.value }))}
+                  onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) saveInlineTask(date) }}
+                  className="input-dark w-full px-3 py-2 rounded-lg text-xs" placeholder="タスク名" autoFocus />
+                <div className="flex items-center gap-2">
+                  <input type="number" min={1} value={inlineTask.point_value}
+                    onChange={e => setInlineTask(t => ({ ...t, point_value: parseInt(e.target.value) || 1 }))}
+                    className="input-dark w-20 shrink-0 px-3 py-1.5 rounded-lg text-xs text-center" />
+                  <span className="text-xs text-slate-500 shrink-0">pt</span>
+                  <div className="flex gap-1 flex-wrap">
+                    {[1,2,3,5,10,20,30,40,50,80,100].map(pt => (
+                      <button key={pt} type="button" onClick={() => setInlineTask(t => ({ ...t, point_value: pt }))}
+                        className={`px-2 py-1 rounded-lg text-[10px] border transition-colors ${inlineTask.point_value === pt ? 'bg-gold-500/20 border-gold-500/50 text-gold-400 font-bold' : 'border-slate-700 text-slate-400'}`}>{pt}</button>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => setShowNewTaskFor(null)} className="flex-1 py-1.5 rounded-lg text-[10px] text-slate-500 border border-slate-700">{T.cancel}</button>
+                  <button onClick={() => saveInlineTask(date)} disabled={savingInlineTask || !inlineTask.content.trim()}
+                    className="flex-1 py-1.5 rounded-lg text-[10px] btn-gold font-bold disabled:opacity-40">
+                    {savingInlineTask ? T.saving : T.createAndSelect}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
 
   return (
     <div data-theme={theme} data-color={colorTheme} className="min-h-screen flex flex-col theme-bg" onClick={() => { setShowSearch(null); setShowNewTaskFor(null) }}>
       {levelUpMsg && (
-        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[200] animate-bounce">
-          <div className="bg-gradient-to-r from-yellow-400 to-orange-400 text-black font-bold px-6 py-3 rounded-full shadow-2xl text-lg tracking-wide">
-            {levelUpMsg}
+        <div className="fixed top-4 right-4 z-[200] animate-in slide-in-from-right-4 fade-in duration-300">
+          <div className="bg-slate-900/95 border border-slate-600/60 text-white px-6 py-4 rounded-2xl shadow-2xl backdrop-blur-sm flex items-center gap-4">
+            <div className="w-1.5 h-12 rounded-full bg-gradient-to-b from-cyan-400 to-blue-500" />
+            <div>
+              <div className="text-xs text-slate-400 uppercase tracking-widest leading-none mb-1">Level Up</div>
+              <div className="text-2xl font-bold tracking-wide">{levelUpMsg}</div>
+            </div>
           </div>
         </div>
       )}
+      {/* スロット日付移動モーダル */}
+      {movingSlot && (
+        <div className="fixed inset-0 z-[300] flex items-end justify-center bg-black/60 backdrop-blur-sm" onClick={() => setMovingSlot(null)}>
+          <div className="w-full max-w-md bg-slate-900 border border-slate-700 rounded-t-2xl p-4 pb-8" onClick={e => e.stopPropagation()}>
+            <div className="text-xs text-slate-400 text-center mb-3">{lang === 'en' ? 'Move to' : '移動先を選択'}</div>
+            <div className="grid grid-cols-7 gap-1">
+              {movingSlot.weekDates.map(d => {
+                const isFrom = d === movingSlot.fromDate
+                const dow = new Date(d + 'T00:00:00').getDay()
+                const label = (lang === 'en' ? ['Su','Mo','Tu','We','Th','Fr','Sa'] : ['日','月','火','水','木','金','土'])[dow]
+                return (
+                  <button key={d} disabled={isFrom} onClick={() => {
+                    const srcSlot = (slots[movingSlot.fromDate] ?? []).find(s => s.id === movingSlot.slotId)
+                    if (srcSlot) { copySingleSlot(srcSlot, d); removeSlot(movingSlot.fromDate, movingSlot.slotId) }
+                    setMovingSlot(null)
+                  }} className={`flex flex-col items-center py-2 rounded-xl text-xs font-bold transition-colors ${isFrom ? 'bg-slate-800 text-slate-600 cursor-default' : 'bg-slate-800/60 text-slate-300 active:bg-gold-500/20 hover:bg-slate-700'}`}>
+                    <span>{label}</span>
+                    <span className="text-[9px] font-normal text-slate-500">{parseInt(d.slice(8))}</span>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
       <header className="sticky top-0 z-50 border-b theme-border-nav theme-bg-header backdrop-blur-md">
         <div className="max-w-3xl mx-auto px-4 h-14 flex items-center justify-between">
-          <span className="text-lg font-bold tracking-widest gold-gradient">ZYVOX</span>
+          <div className="flex items-center gap-1.5">
+            <button onClick={undoRemoveSlot} disabled={undoStack.current.length === 0}
+              className="w-7 h-7 flex items-center justify-center rounded text-slate-400 hover:text-white disabled:opacity-20 disabled:pointer-events-none text-base leading-none transition-colors" title="元に戻す">‹</button>
+            <button onClick={redoRemoveSlot} disabled={redoStack.current.length === 0}
+              className="w-7 h-7 flex items-center justify-center rounded text-slate-400 hover:text-white disabled:opacity-20 disabled:pointer-events-none text-base leading-none transition-colors" title="やり直し">›</button>
+            <span className="text-lg font-bold tracking-widest gold-gradient">Leveling</span>
+          </div>
           <div className="flex items-center gap-2">
             {/* カラーテーマピッカー */}
             <div className="flex items-center gap-1">
@@ -1851,7 +2643,6 @@ export default function ClientPortal() {
             <div className="text-right">
               <div className="text-sm font-semibold text-white leading-tight">{data.name}</div>
               <div className="flex items-center gap-2 justify-end mt-0.5">
-                <span className="text-[11px] font-bold px-1.5 py-0.5 rounded border border-gold-500/40 text-gold-400">Lv.{level}</span>
                 <span className="text-[11px] text-slate-400">{score.toLocaleString()} pt</span>
               </div>
             </div>
@@ -1865,7 +2656,7 @@ export default function ClientPortal() {
         </div>
       )}
 
-      <main className="flex-1 max-w-3xl mx-auto w-full px-3 py-3 pb-28 space-y-3">
+      <main className={`flex-1 mx-auto w-full px-3 py-3 pb-28 space-y-3 ${tab === 'plan' ? 'max-w-5xl' : 'max-w-3xl'}`}>
 
         {/* ======= HOME ======= */}
         {tab === 'home' && (
@@ -1880,7 +2671,6 @@ export default function ClientPortal() {
                     <div className="flex items-baseline gap-2">
                       <span className="text-2xl font-bold text-white">{score.toLocaleString()}</span>
                       <span className="text-sm text-slate-400">pt</span>
-                      <span className="text-xs font-bold text-gold-400 ml-1">Lv.{level}</span>
                     </div>
                     <div className="flex gap-1">
                       {(['daily', 'weekly', 'monthly'] as ChartPeriod[]).map(p => (
@@ -1900,7 +2690,6 @@ export default function ClientPortal() {
 
             <div className="glass-card rounded-xl px-3 py-2">
               <div className="flex items-center gap-2">
-                <span className="text-base font-bold text-gold-400">Lv.{level}</span>
                 <div className="flex-1 min-w-0">
                   {showLevelBar && (
                     <>
@@ -1914,7 +2703,7 @@ export default function ClientPortal() {
                   )}
                 </div>
                 <div className="text-right shrink-0">
-                  <div className="text-sm font-bold text-white">{score.toLocaleString()}<span className="text-[10px] text-slate-400 ml-0.5">pt</span></div>
+                  <div className="text-sm font-bold text-white">Lv.{level}</div>
                 </div>
                 <button onClick={() => setShowLevelBar(v => !v)} className="text-[10px] text-slate-600 hover:text-slate-400 shrink-0">
                   {showLevelBar ? '▲' : '▼'}
@@ -1950,22 +2739,18 @@ export default function ClientPortal() {
                       return (
                         <div key={key} className={`border-l-2 pl-2.5 ${key === 'goal_3y' ? 'border-gold-500/60' : key === 'goal_1y' ? 'border-gold-500/35' : 'border-gold-500/20'} ${py}`}>
                           <div className="flex items-baseline gap-1.5 mb-0.5">
-                            <div className={`${labelSize} text-gold-400/70 font-bold`}>{formatGoalLabel(labels[key], lang)}</div>
+                            <div className={`${labelSize} text-gold-400/70 font-bold`}>{formatGoalLabel(labels[key], lang)}まで</div>
                             {goalRemainingText(labels[key], lang) && <div className="text-[9px] text-slate-500">{goalRemainingText(labels[key], lang)}</div>}
                           </div>
-                          <textarea
+                          <RichEditor
                             value={homeGoalDrafts[key] ?? ''}
-                            onChange={e => {
-                              const val = e.target.value
+                            onChange={val => {
                               setHomeGoalDrafts(d => ({ ...d, [key]: val }))
-                              e.target.style.height = 'auto'
-                              e.target.style.height = e.target.scrollHeight + 'px'
                               saveGoal(key, val)
                             }}
-                            ref={el => { if (el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px' } }}
-                            className={`bg-transparent border-none outline-none ${textSize} text-slate-300 placeholder-slate-700 w-full resize-none overflow-hidden leading-snug`}
+                            multiline
                             placeholder="入力..."
-                            rows={1}
+                            className={`bg-transparent ${textSize} text-slate-300 w-full leading-snug`}
                           />
                         </div>
                       )
@@ -1975,500 +2760,368 @@ export default function ClientPortal() {
               )
             })()}
 
-            {/* 今月のゴール */}
-            <div className="glass-card rounded-xl px-3 py-2.5">
-              <div className="flex items-center justify-between mb-1">
-                <div className="text-[9px] text-slate-500 font-bold uppercase tracking-widest">
-                  {T.monthGoalLabel(currentMonth)}
-                </div>
-                <button
-                  onMouseDown={e => { e.preventDefault(); setMonthGoalColorBar(v => !v) }}
-                  className="text-[9px] text-slate-600 hover:text-slate-400 transition-colors px-1"
-                  title="文字色を変える"
-                >🎨</button>
-              </div>
-              {monthGoalColorBar && (
-                <div className="flex items-center gap-1.5 mb-1.5 flex-wrap">
-                  {[
-                    { label: 'リセット', color: '', display: '#94a3b8' },
-                    { label: '赤', color: '#ff5555', display: '#ff5555' },
-                    { label: 'オレンジ', color: '#fb923c', display: '#fb923c' },
-                    { label: '黄', color: '#facc15', display: '#facc15' },
-                    { label: '緑', color: '#4ade80', display: '#4ade80' },
-                    { label: '青', color: '#60a5fa', display: '#60a5fa' },
-                    { label: 'シアン', color: '#22d3ee', display: '#22d3ee' },
-                    { label: 'ピンク', color: '#f472b6', display: '#f472b6' },
-                  ].map(c => (
-                    <button
-                      key={c.label}
-                      title={c.label}
-                      onMouseDown={e => {
-                        e.preventDefault()
-                        monthlyGoalRef.current?.focus()
-                        if (c.color) {
-                          document.execCommand('foreColor', false, c.color)
-                        } else {
-                          document.execCommand('removeFormat', false)
-                        }
-                        const html = monthlyGoalRef.current?.innerHTML ?? ''
-                        setMonthlyGoalText(html)
-                        if (monthlyGoalTimer.current) clearTimeout(monthlyGoalTimer.current)
-                        monthlyGoalTimer.current = setTimeout(() => {
-                          fetch(`/api/client/${token}/monthly-goal`, {
-                            method: 'POST', headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ content: html, period_label: currentMonth }),
-                          })
-                        }, 300)
-                      }}
-                      className="w-4 h-4 rounded-full border border-slate-700 shrink-0 transition-transform hover:scale-110"
-                      style={{ background: c.display }}
-                    />
-                  ))}
-                </div>
-              )}
-              <div
-                ref={monthlyGoalRef}
-                contentEditable
-                suppressContentEditableWarning
-                onFocus={() => setMonthGoalColorBar(true)}
-                onInput={() => {
-                  const html = monthlyGoalRef.current?.innerHTML ?? ''
-                  if (monthlyGoalTimer.current) clearTimeout(monthlyGoalTimer.current)
-                  monthlyGoalTimer.current = setTimeout(() => {
-                    fetch(`/api/client/${token}/monthly-goal`, {
-                      method: 'POST', headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ content: html, period_label: currentMonth }),
-                    })
-                  }, 800)
-                }}
-                className={`bg-transparent border-none outline-none text-sm text-slate-300 w-full leading-relaxed min-h-[1.5em] empty:before:text-slate-700 ${lang === 'en' ? "empty:before:content-['Monthly_goal...']" : "empty:before:content-['今月達成したいこと...']"}`}
-                style={{ wordBreak: 'break-all', whiteSpace: 'pre-wrap' }}
-              />
-            </div>
+            {/* ★ 月ボタングリッド + 選択月の週カード */}
+            {(() => {
+              const currentYear = parseInt(today.slice(0, 4))
+              // 各月にデータがあるか（ロード済みoffsetが存在）
+              function monthHasData(yearMonth: string) {
+                return displayedOffsets.some(o => {
+                  const ws = o === 0 ? (data?.week_start ?? '') : (weekDataCache.current[o]?.week_start ?? '')
+                  return ws.startsWith(yearMonth)
+                })
+              }
+              const viewMonth = selectedHistoryMonth ?? currentMonth
+              // 選択月のoffsets（week_startが対象月 OR 週内に対象月の日付がある）
+              const monthOffsets = displayedOffsets.filter(o => {
+                const ws = o === 0 ? (data?.week_start ?? '') : (weekDataCache.current[o]?.week_start ?? '')
+                if (!ws) return false
+                // 週の開始日の月で判定（月末週は翌月に跨いでも開始月に帰属）
+                return ws.slice(0, 7) === viewMonth
+              }).sort((a, b) => b - a)
 
-            {/* ★ Week ToDo */}
-            <div className="glass-card rounded-2xl">
-              <div className="flex items-center justify-between px-3 pt-3 pb-2 border-b border-slate-800/60">
-                <div className="flex items-center gap-2 flex-1 min-w-0">
-                  <button onClick={() => switchWeek(weekOffset - 1)} className="w-7 h-7 shrink-0 flex items-center justify-center rounded-lg border border-slate-700 text-slate-400 hover:border-slate-500 text-sm transition-colors">‹</button>
-                  <div className="shrink-0 text-center">
-                    <div className={`text-xs font-bold ${weekOffset === 0 ? 'text-gold-400' : weekOffset > 0 ? 'text-emerald-400' : 'text-slate-400'}`}>{weekLabel}</div>
-                    <div className="text-[9px] text-slate-600">{weekRangeLabel}</div>
-                  </div>
-                  <button onClick={() => switchWeek(weekOffset + 1)} className="w-7 h-7 shrink-0 flex items-center justify-center rounded-lg border border-slate-700 text-slate-400 hover:border-slate-500 text-sm transition-colors">›</button>
-                  {weekOffset !== 0 && <button onClick={() => switchWeek(0)} className="text-[9px] text-slate-600 hover:text-slate-400 underline shrink-0">{T.thisWeek}</button>}
-                </div>
-                <button onClick={() => { const n: WeekStart = weekStartDay === 1 ? 0 : 1; setWeekStartDay(n); localStorage.setItem('weekStartDay', String(n)) }}
-                  className="text-[9px] border border-slate-700 text-slate-500 px-1.5 py-1 rounded-lg hover:text-slate-400 transition-colors">
-                  {T.weekStart(weekStartDay)}
-                </button>
-              </div>
-              {/* 週の目標（2行テキストエリア） */}
-              <textarea
-                rows={2}
-                value={weeklyGoalText}
-                onChange={e => {
-                  setWeeklyGoalText(e.target.value)
-                  const ws = weekStart
-                  if (weeklyGoalTimer.current) clearTimeout(weeklyGoalTimer.current)
-                  weeklyGoalTimer.current = setTimeout(() => {
-                    fetch(`/api/client/${token}/weekly-goal`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ content: e.target.value, week_start: ws }),
-                    })
-                    setData(prev => {
-                      if (!prev) return prev
-                      const goals = prev.client_goals as any[]
-                      const exists = goals.some(g => g.goal_type === 'weekly' && g.period_label === ws)
-                      return {
-                        ...prev,
-                        client_goals: exists
-                          ? goals.map(g => g.goal_type === 'weekly' && g.period_label === ws ? { ...g, content: e.target.value } : g)
-                          : [...goals, { id: 'wg_' + ws, client_id: '', goal_type: 'weekly', period_label: ws, content: e.target.value, point_value: 0 }]
-                      }
-                    })
-                  }, 800)
-                }}
-                className="w-full px-3 py-2 bg-transparent border-none border-t border-slate-800/60 outline-none resize-none text-xs text-slate-300 placeholder-slate-700"
-                placeholder={T.weekGoalPlaceholder}
-              />
+              // 今週カード（offset=0）は常に最上部で別出し
+              const currentWeekOffset = monthOffsets.includes(0) ? 0 : (viewMonth === currentMonth ? 0 : null)
+              const pastWeekOffsets = monthOffsets.filter(o => o !== 0)
 
-              {weekLoading ? (
-                <div className="py-8 text-center text-slate-600 text-xs">読み込み中...</div>
-              ) : (
-                <div className="divide-y divide-slate-800/40">
-                  {weekDates.map((date, i) => {
-                    const isToday = date === today
-                    const isFuture = date > today
-                    const isExpanded = expandedDates.has(date)
-                    const daySlots = slots[date] ?? []
-                    const donePts = daySlots.filter(s => completions[ck(s.id, date)]).reduce((sum, s) => sum + s.point_value, 0)
-                    const doneCount = daySlots.filter(s => completions[ck(s.id, date)]).length
-                    const d = new Date(date)
-                    const q = quickAdd[date] ?? { time: '', search: '', task_id: '', task_name: '', point_value: 0 }
-                    const filteredForDate = getOrderedTasks().filter(t => q.search === '' || t.content.toLowerCase().includes(q.search.toLowerCase()))
+              // 月の最初・最後の日
+              const firstDayOfViewMonth = viewMonth + '-01'
+              const lastDayOfViewMonth = (() => {
+                const d = new Date(viewMonth + '-01T00:00:00')
+                d.setMonth(d.getMonth() + 1); d.setDate(0)
+                return localDate(d)
+              })()
 
+              // 月内のoffsetをws昇順にソート
+              const sortedMonthOffsets = [...monthOffsets].sort((a, b) => {
+                const wsA = a === 0 ? (data?.week_start ?? '') : (weekDataCache.current[a]?.week_start ?? '')
+                const wsB = b === 0 ? (data?.week_start ?? '') : (weekDataCache.current[b]?.week_start ?? '')
+                return wsA < wsB ? -1 : 1
+              })
+              const firstOffInMonth = sortedMonthOffsets[0] ?? null
+              const lastOffInMonth = sortedMonthOffsets[sortedMonthOffsets.length - 1] ?? null
+
+              // 日付からslot/completionを取得するoffsetを探す
+              const getOffsetForDate = (date: string): number | null => {
+                if ((data?.week_start && getWeekDates(data.week_start).includes(date))) return 0
+                for (const [off, wk] of Object.entries(weekDataCache.current)) {
+                  if (getWeekDates(wk.week_start).includes(date)) return parseInt(off)
+                }
+                return null
+              }
+
+              return (
+                <>
+                  {/* 今月の月次ゴール（固定） */}
+                  {(() => {
+                    const planDefault = planMonthDefaults[currentMonth] || ''
+                    const displayVal = monthlyGoals[currentMonth] !== undefined ? monthlyGoals[currentMonth] : planDefault
                     return (
-                      <div key={date}>
-                        <div className={`flex items-center gap-2 px-3 py-2 transition-colors hover:bg-slate-800/30 ${isToday ? 'bg-gold-500/5' : ''}`}>
-                          {/* クリックで展開する左エリア */}
-                          <button
-                            onClick={() => setExpandedDates(prev => { const s = new Set(prev); isExpanded ? s.delete(date) : s.add(date); return s })}
-                            className="flex items-center gap-2 shrink-0"
-                          >
-                            <span className={`text-sm font-bold w-10 shrink-0 ${isToday ? 'text-gold-400' : isFuture && weekOffset === 0 ? 'text-slate-500' : 'text-slate-300'}`}>{dayLabels[i]}</span>
-                            <span className={`text-xs w-5 shrink-0 ${isToday ? 'text-gold-400' : 'text-slate-600'}`}>{d.getDate()}</span>
-                            {isToday && <span className="text-[8px] px-1 py-0.5 rounded bg-gold-500/20 text-gold-400 font-bold">TODAY</span>}
-                          </button>
-
-                          {/* 今日の目標インライン入力（全日） */}
-                          <input
-                            type="text"
-                            value={weekGoals[date] ?? ''}
-                            onChange={e => saveGoal(date, e.target.value)}
-                            onClick={e => e.stopPropagation()}
-                            className={`flex-1 min-w-0 bg-transparent border-none outline-none text-xs placeholder-slate-700 ${isToday ? 'text-slate-300' : 'text-slate-500'} ${goalChecked[date] ? 'line-through text-slate-600' : ''}`}
-                            placeholder={T.todayGoalPlaceholder}
-                          />
-                          {/* 目標達成チェック */}
-                          {weekGoals[date] && (
-                            <button
-                              onClick={e => { e.stopPropagation(); toggleGoalCheck(date) }}
-                              className={`shrink-0 w-5 h-5 rounded-full border flex items-center justify-center transition-all text-[9px] font-bold ${goalChecked[date] ? 'bg-gold-500 border-gold-400 text-navy-950' : 'border-slate-700 text-slate-700 hover:border-gold-500/50 hover:text-gold-400'}`}
-                              title={goalChecked[date] ? '達成済み (+10pt)' : '達成としてマーク (+10pt)'}
-                            >
-                              {goalChecked[date] ? '✓' : ''}
-                            </button>
-                          )}
-
-                          {/* 右側：進捗ドット＋展開 */}
-                          <button
-                            onClick={() => setExpandedDates(prev => { const s = new Set(prev); isExpanded ? s.delete(date) : s.add(date); return s })}
-                            className="flex items-center gap-1.5 shrink-0"
-                          >
-                            {daySlots.length > 0 ? (
-                              <>
-                                <div className="flex gap-0.5">{daySlots.slice(0, 8).map(s => <div key={s.id} className={`w-1.5 h-1.5 rounded-full ${completions[ck(s.id, date)] ? 'bg-emerald-400' : 'bg-slate-700'}`} />)}</div>
-                                <span className="text-[10px] text-slate-500">{doneCount}/{daySlots.length}</span>
-                                {donePts > 0 && <span className="text-[10px] text-gold-400 font-bold">+{donePts}</span>}
-                              </>
-                            ) : <span className="text-[10px] text-slate-700">—</span>}
-                            <span className={`text-slate-700 text-[10px] ml-0.5 transition-transform inline-block ${isExpanded ? 'rotate-180' : ''}`}>▾</span>
-                          </button>
+                      <div className="glass-card rounded-xl overflow-hidden">
+                        <div className="px-3 py-2 border-b border-slate-800/40 flex items-center justify-between">
+                          <span className="text-sm font-bold text-gold-400">
+                            {parseInt(currentMonth.split('-')[1])}月（今月）
+                          </span>
+                          {loadingMore && <span className="text-[10px] text-slate-600">読み込み中...</span>}
                         </div>
+                        <div className="px-3 py-2">
+                          <RichEditor
+                            key={`${currentMonth}-${planDefault ? 'plan' : 'db'}`}
+                            value={displayVal}
+                            onChange={v => {
+                              setMonthlyGoals(p => ({ ...p, [currentMonth]: v }))
+                              if (monthlyGoalTimers.current[currentMonth]) clearTimeout(monthlyGoalTimers.current[currentMonth])
+                              monthlyGoalTimers.current[currentMonth] = setTimeout(() => {
+                                fetch(`/api/client/${token}/monthly-goal`, {
+                                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ content: v, period_label: currentMonth }),
+                                })
+                              }, 800)
+                            }}
+                            placeholder="達成すること..."
+                            className="text-base text-slate-100 w-full leading-relaxed font-medium"
+                            multiline
+                          />
+                        </div>
+                      </div>
+                    )
+                  })()}
 
-                        {isExpanded && (
-                          <div className="theme-bg-sub px-3 pt-1.5 pb-2 space-y-0.5" onClick={e => e.stopPropagation()}>
-                            {daySlots.map(slot => {
-                              const done = !!completions[ck(slot.id, date)]
-                              const isLoad = toggling === ck(slot.id, date)
-                              const isEditing = editingSlotId === slot.id
-                              const editSearch = editingSlotDraft.task_name
-                              const filteredEdit = tasks.filter(t => editSlotSearch === '' || t.content.toLowerCase().includes(editSlotSearch.toLowerCase()))
-
-                              if (isEditing) {
-                                return (
-                                  <div key={slot.id} className="rounded-lg border border-gold-500/30 bg-slate-800/50 px-2 py-1.5 space-y-1.5">
-                                    <div className="flex gap-1.5">
-                                      <input
-                                        type="text"
-                                        value={editingSlotDraft.time}
-                                        onChange={e => setEditingSlotDraft(d => ({ ...d, time: e.target.value }))}
-                                        className="input-dark w-20 shrink-0 px-2 py-1 rounded-lg text-xs font-mono text-center"
-                                        placeholder="8-10"
-                                      />
-                                      <div className="flex-1 relative">
-                                        <input
-                                          type="text"
-                                          value={editingSlotDraft.task_name || editSlotSearch}
-                                          onChange={e => { setEditSlotSearch(e.target.value); setEditingSlotDraft(d => ({ ...d, task_name: e.target.value })); setShowEditSlotSearch(true) }}
-                                          onFocus={() => { setShowEditSlotSearch(true) }}
-                                          className="input-dark w-full px-2 py-1 rounded-lg text-xs text-slate-200"
-                                          placeholder={T.searchTask}
-                                        />
-                                        {showEditSlotSearch && (
-                                          <div className="absolute bottom-full left-0 right-0 mb-1 z-50 max-h-[50vh] overflow-y-auto rounded-xl border border-slate-700 theme-bg shadow-xl divide-y divide-slate-800/50">
-                                            {filteredEdit.map(t => (
-                                              <button key={t.id} onMouseDown={e => { e.preventDefault(); setEditingSlotDraft(d => ({ ...d, task_id: t.id, task_name: t.content, point_value: t.point_value })); setEditSlotSearch(''); setShowEditSlotSearch(false) }}
-                                                className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-slate-700/30">
-                                                <span className="text-xs text-slate-300 truncate">{t.content}</span>
-                                                <span className="text-[10px] text-gold-400/70 shrink-0">+{t.point_value}pt</span>
-                                              </button>
-                                            ))}
-                                          </div>
-                                        )}
-                                      </div>
-                                    </div>
-                                    <div className="flex items-center gap-1.5">
-                                      <input type="number" min={1} value={editingSlotDraft.point_value}
-                                        onChange={e => setEditingSlotDraft(d => ({ ...d, point_value: parseInt(e.target.value) || 1 }))}
-                                        className="input-dark w-14 shrink-0 px-2 py-1 rounded-lg text-xs text-center" />
-                                      <span className="text-[10px] text-slate-500 shrink-0">pt</span>
-                                      <div className="flex gap-1 flex-wrap">
-                                        {[1,2,3,5,10,20].map(pt => (
-                                          <button key={pt} type="button" onClick={() => setEditingSlotDraft(d => ({ ...d, point_value: pt }))}
-                                            className={`px-1.5 py-0.5 rounded text-[10px] border ${editingSlotDraft.point_value === pt ? 'bg-gold-500/20 border-gold-500/50 text-gold-400' : 'border-slate-700 text-slate-500'}`}>{pt}</button>
-                                        ))}
-                                      </div>
-                                    </div>
-                                    <div className="flex gap-1.5">
-                                      <button onClick={() => setEditingSlotId(null)} className="flex-1 py-1 rounded-lg text-[10px] text-slate-500 border border-slate-700">{T.cancel}</button>
-                                      <button onClick={() => commitEditSlot(date)} className="flex-1 py-1 rounded-lg text-[10px] btn-gold font-bold">{T.save}</button>
-                                    </div>
-                                  </div>
-                                )
-                              }
-
-                              const slotDropHere = slotDropTarget?.id === slot.id ? slotDropTarget.pos : null
-                              return (
-                                <div
-                                  key={slot.id}
-                                  draggable
-                                  onDragStart={e => { e.stopPropagation(); setDragSlotId(slot.id) }}
-                                  onDragOver={e => { if (dragSlotId === slot.id) return; e.preventDefault(); e.stopPropagation(); const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); setSlotDropTarget({ id: slot.id, pos: e.clientY < r.top + r.height / 2 ? 'before' : 'after' }) }}
-                                  onDragLeave={() => setSlotDropTarget(null)}
-                                  onDrop={e => { e.preventDefault(); e.stopPropagation(); if (dragSlotId && slotDropHere) { reorderSlotArray(date, dragSlotId, slot.id, slotDropHere === 'before'); setDragSlotId(null); setSlotDropTarget(null) } }}
-                                  onDragEnd={() => { setDragSlotId(null); setSlotDropTarget(null) }}
-                                  className={`relative flex items-center gap-1.5 rounded-lg px-2 py-0.5 border transition-colors ${done ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-slate-800/30 border-slate-700/30'} ${dragSlotId === slot.id ? 'opacity-40' : ''}`}
-                                >
-                                  {slotDropHere === 'before' && <div className="absolute top-0 left-0 right-0 h-0.5 bg-gold-400 pointer-events-none rounded" />}
-                                  {slotDropHere === 'after' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gold-400 pointer-events-none rounded" />}
-                                  <span className="text-slate-500 hover:text-slate-300 text-sm cursor-grab active:cursor-grabbing shrink-0 select-none leading-none">⠿</span>
-                                  <button onClick={() => toggleTask(slot.task_id, slot.id, date, slot.point_value)} disabled={isLoad}
-                                    className={`w-5 h-5 rounded-md border flex items-center justify-center shrink-0 transition-all active:scale-90 disabled:opacity-40 ${done ? 'bg-emerald-500 border-emerald-500' : 'border-slate-600'}`}>
-                                    {isLoad ? <span className="text-[6px] text-slate-500">…</span> : done ? <span className="text-white text-[8px] font-bold">✓</span> : null}
-                                  </button>
-                                  <button onClick={() => startEditSlot(slot)} className={`text-[10px] font-mono shrink-0 min-w-[32px] text-left hover:text-gold-400 transition-colors ${done ? 'text-emerald-400/50' : 'text-slate-500'}`}>{slot.time || '—'}</button>
-                                  <button onClick={() => startEditSlot(slot)} className="shrink-0 text-xs text-left">
-                                    <span className={done ? 'line-through text-slate-500' : 'text-slate-200'}>{data.client_goals.find(g => g.id === slot.task_id)?.content ?? slot.task_name}</span>
-                                  </button>
-                                  <input
-                                    type="text"
-                                    value={slotMemos[slot.id] !== undefined ? slotMemos[slot.id] : (slot.task_memo ?? '')}
-                                    onChange={e => setSlotMemos(m => ({ ...m, [slot.id]: e.target.value }))}
-                                    onBlur={e => updateSlotMemo(date, slot.id, e.target.value)}
-                                    onClick={e => e.stopPropagation()}
-                                    className="flex-1 min-w-0 bg-transparent border-none outline-none text-[10px] text-slate-500 placeholder-slate-700"
-                                    placeholder={T.memoPlaceholder}
-                                  />
-                                  <span className="text-[10px] text-gold-400/60 shrink-0">+{slot.point_value}</span>
-                                  <button onClick={() => removeSlot(date, slot.id)} className="text-slate-700 hover:text-red-400 text-[10px] shrink-0 w-5 h-5 flex items-center justify-center transition-colors">✕</button>
-                                </div>
-                              )
-                            })}
-
-                            {/* クイック追加フォーム */}
-                            <div className="relative flex gap-1.5 mt-1">
-                              <input type="text" value={q.time}
-                                onChange={e => setQuickAdd(qa => ({ ...qa, [date]: { ...q, time: e.target.value } }))}
-                                onKeyDown={e => { if (e.key === 'Enter') commitQuickAdd(date) }}
-                                className="input-dark w-20 shrink-0 px-2 py-2 rounded-lg text-xs font-mono text-center"
-                                placeholder="8-10" />
-
-                              <div className="flex-1 relative">
-                                <input type="text"
-                                  value={q.task_id ? q.task_name : q.search}
-                                  onChange={e => { setQuickAdd(qa => ({ ...qa, [date]: { ...q, search: e.target.value, task_id: '', task_name: '', point_value: 0 } })); setShowSearch(date) }}
-                                  onFocus={() => setShowSearch(date)}
-                                  onKeyDown={e => { if (e.key === 'Enter' && q.task_id) commitQuickAdd(date) }}
-                                  onDoubleClick={() => { if (q.task_id) commitQuickAdd(date) }}
-                                  className={`input-dark w-full px-2 py-2 rounded-lg text-xs ${q.task_id ? 'text-gold-400' : 'text-slate-300'}`}
-                                  placeholder={tasks.length === 0 ? T.noTaskYet : T.searchTask}
-                                  readOnly={!!q.task_id} />
-                                {q.task_id && (
-                                  <button onClick={() => setQuickAdd(qa => ({ ...qa, [date]: { ...q, task_id: '', task_name: '', point_value: 0, search: '' } }))}
-                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-600 hover:text-slate-400 text-[10px]">✕</button>
-                                )}
-                                {showSearch === date && !q.task_id && (
-                                  <div className="absolute bottom-full left-0 right-0 mb-1 z-50 max-h-[50vh] overflow-y-auto rounded-xl border border-slate-700 theme-bg shadow-xl divide-y divide-slate-800/50">
-                                    {filteredForDate.map(t => (
-                                      <div key={t.id} className="divide-y divide-slate-800/30">
-                                        {editingTaskId === t.id ? (
-                                          <div className="px-3 py-2 space-y-1.5 bg-slate-800/60" onMouseDown={e => e.preventDefault()}>
-                                            <input type="text" value={editingTaskDraft.content}
-                                              onChange={e => setEditingTaskDraft(d => ({ ...d, content: e.target.value }))}
-                                              className="input-dark w-full px-2 py-1 rounded-lg text-xs" placeholder="タスク名" autoFocus />
-                                            <div className="flex items-center gap-1.5">
-                                              <input type="number" min={1} value={editingTaskDraft.point_value}
-                                                onChange={e => setEditingTaskDraft(d => ({ ...d, point_value: parseInt(e.target.value) || 1 }))}
-                                                className="input-dark w-14 px-2 py-1 rounded-lg text-xs text-center" />
-                                              <span className="text-[10px] text-slate-500 shrink-0">pt</span>
-                                              <div className="flex gap-1 flex-wrap">
-                                                {[1, 2, 3, 5, 10, 20].map(pt => (
-                                                  <button key={pt} type="button" onMouseDown={e => { e.preventDefault(); setEditingTaskDraft(d => ({ ...d, point_value: pt })) }}
-                                                    className={`px-1.5 py-0.5 rounded text-[10px] border ${editingTaskDraft.point_value === pt ? 'bg-gold-500/20 border-gold-500/50 text-gold-400' : 'border-slate-700 text-slate-500'}`}>{pt}</button>
-                                                ))}
-                                              </div>
-                                            </div>
-                                            <div className="flex gap-1.5">
-                                              <button onMouseDown={e => { e.preventDefault(); setEditingTaskId(null) }} className="flex-1 py-1 rounded-lg text-[10px] border border-slate-700 text-slate-500">{T.cancel}</button>
-                                              <button onMouseDown={e => { e.preventDefault(); commitEditTask() }} disabled={savingTaskEdit || !editingTaskDraft.content.trim()}
-                                                className="flex-1 py-1 rounded-lg text-[10px] btn-gold font-bold disabled:opacity-40">{savingTaskEdit ? '...' : T.save}</button>
-                                            </div>
-                                          </div>
-                                        ) : (() => {
-                                          const taskDropHere = taskDropTarget?.id === t.id ? taskDropTarget.pos : null
-                                          return (
-                                          <div
-                                            className={`relative flex items-center hover:bg-slate-700/30 transition-colors group ${dragTaskId === t.id ? 'opacity-40' : ''}`}
-                                            draggable
-                                            onDragStart={e => { e.stopPropagation(); setDragTaskId(t.id) }}
-                                            onDragOver={e => { if (dragTaskId === t.id) return; e.preventDefault(); e.stopPropagation(); const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); setTaskDropTarget({ id: t.id, pos: e.clientY < r.top + r.height / 2 ? 'before' : 'after' }) }}
-                                            onDragLeave={() => setTaskDropTarget(null)}
-                                            onDrop={e => { e.preventDefault(); e.stopPropagation(); if (dragTaskId && taskDropHere) { reorderTasks(dragTaskId, t.id, taskDropHere === 'before'); setDragTaskId(null); setTaskDropTarget(null) } }}
-                                            onDragEnd={() => { setDragTaskId(null); setTaskDropTarget(null) }}
-                                          >
-                                            {taskDropHere === 'before' && <div className="absolute top-0 left-0 right-0 h-0.5 bg-gold-400 pointer-events-none" />}
-                                            {taskDropHere === 'after' && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-gold-400 pointer-events-none" />}
-                                            <span onMouseDown={e => e.preventDefault()} className="pl-2 text-slate-600 hover:text-slate-400 text-sm cursor-grab active:cursor-grabbing shrink-0 select-none leading-none">⠿</span>
-                                            <button
-                                              onMouseDown={e => { e.preventDefault(); setQuickAdd(qa => ({ ...qa, [date]: { ...q, task_id: t.id, task_name: t.content, point_value: t.point_value, task_memo: '', search: '' } })); setShowSearch(null) }}
-                                              onDoubleClick={e => { e.preventDefault(); setQuickAdd(qa => ({ ...qa, [date]: { ...q, task_id: t.id, task_name: t.content, point_value: t.point_value, task_memo: '', search: '' } })); setShowSearch(null); setTimeout(() => commitQuickAdd(date), 0) }}
-                                              className="flex-1 text-left px-3 py-2 min-w-0">
-                                              <div className="flex items-center gap-2">
-                                                <span className="text-xs text-slate-300 truncate">{t.content}</span>
-                                                <span className="text-[10px] text-gold-400/70 shrink-0">+{t.point_value}pt</span>
-                                              </div>
-                                            </button>
-                                            <button onMouseDown={e => { e.preventDefault(); startEditTask(t) }}
-                                              className="px-2 py-2 text-slate-600 hover:text-gold-400 text-[10px] opacity-0 group-hover:opacity-100 transition-all shrink-0">✎</button>
-                                            <button onMouseDown={e => { e.preventDefault(); deleteTask(t.id) }}
-                                              className="px-2 py-2 text-slate-700 hover:text-red-400 text-[10px] opacity-0 group-hover:opacity-100 transition-all shrink-0">✕</button>
-                                          </div>
-                                          )
-                                        })()}
-                                      </div>
-                                    ))}
-                                    <button
-                                      onMouseDown={e => {
-                                        e.preventDefault()
-                                        setShowNewTaskFor(date)
-                                        setShowSearch(null)
-                                        setTimeout(() => {
-                                          document.getElementById(`new-task-form-${date}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-                                        }, 100)
-                                      }}
-                                      className="w-full text-left px-3 py-2.5 flex items-center gap-2 hover:bg-gold-500/10 transition-colors">
-                                      <span className="text-[10px] text-gold-400 font-bold">＋ 新しいタスクを作る</span>
-                                      {q.search && <span className="text-[10px] text-slate-500">「{q.search}」</span>}
-                                    </button>
-                                  </div>
-                                )}
-                              </div>
-
-                              <button onClick={() => commitQuickAdd(date)} disabled={!q.task_id || !q.time}
-                                className="shrink-0 w-9 h-[34px] rounded-lg btn-gold flex items-center justify-center text-sm font-bold disabled:opacity-30 disabled:cursor-not-allowed">
-                                +
-                              </button>
+                  {/* 今週カードは常に表示（選択月に関わらず） */}
+                  {(() => {
+                    const ws0 = data?.week_start ?? null
+                    if (!ws0) return null
+                    // 今日が属するカレンダーブロック（1-7, 8-14, 15-21, 22-末日）
+                    const todayDay = parseInt(today.slice(8, 10))
+                    const todayMonth = today.slice(0, 7)
+                    const lastDayOfTodayMonth = (() => { const d = new Date(todayMonth + '-01T00:00:00'); d.setMonth(d.getMonth()+1); d.setDate(0); return d.getDate() })()
+                    let bStart: number, bEnd: number
+                    if (todayDay <= 7) { bStart = 1; bEnd = 7 }
+                    else if (todayDay <= 14) { bStart = 8; bEnd = 14 }
+                    else if (todayDay <= 21) { bStart = 15; bEnd = 21 }
+                    else { bStart = 22; bEnd = lastDayOfTodayMonth }
+                    const wDates = Array.from({length: bEnd - bStart + 1}, (_, i) => todayMonth + '-' + String(bStart + i).padStart(2, '0'))
+                    const isWeekCollapsed = false
+                    const wRangeLabel = `${parseInt(todayMonth.slice(5))}/${bStart} – ${parseInt(todayMonth.slice(5))}/${bEnd}`
+                    const offset = 0
+                    const isCurrentWeek = true
+                    return (
+                      <Fragment key="current-week">
+                        <div id="week-card-0" className="glass-card rounded-2xl">
+                          <div className="flex items-center justify-between px-3 pt-3 pb-2 border-b border-slate-800/60">
+                            <button className="flex-1 text-left">
+                              <div className="text-xs font-bold text-gold-400">{lang === 'en' ? 'This Week' : '今週'}</div>
+                              <div className="text-[9px] text-slate-600">{wRangeLabel}</div>
+                            </button>
+                            <div className="flex items-center gap-2">
+                              {(() => {
+                                const weekPts = wDates.reduce((s, date) => {
+                                  const ds = slots[date] ?? []
+                                  return s + ds.filter(sl => completions[ck(sl.id, date)]).reduce((ps, sl) => ps + sl.point_value, 0)
+                                }, 0)
+                                return weekPts > 0 ? <span className="text-xs text-gold-400 font-semibold">+{weekPts}pt</span> : null
+                              })()}
+                              <select value={weekStartDay} onChange={e => { const n = parseInt(e.target.value) as WeekStart; setWeekStartDay(n); localStorage.setItem('weekStartDay', String(n)) }}
+                                className="text-[9px] border border-slate-700 bg-transparent text-slate-500 px-1 py-0.5 rounded-lg">
+                                {['日','月','火','水','木','金','土'].map((d, i) => <option key={i} value={i} className="bg-slate-900">{d}始</option>)}
+                              </select>
                             </div>
-
-                            {/* ★ インラインタスク作成フォーム */}
-                            {showNewTaskFor === date && (
-                              <div id={`new-task-form-${date}`} className="bg-slate-800/50 rounded-xl p-3 space-y-2 border border-slate-700/50" onClick={e => e.stopPropagation()}>
-                                <div className="text-[9px] text-gold-400 font-bold uppercase tracking-wider">{T.addNewTask}</div>
-                                <input type="text" value={inlineTask.content}
-                                  onChange={e => setInlineTask(t => ({ ...t, content: e.target.value }))}
-                                  onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) saveInlineTask(date) }}
-                                  className="input-dark w-full px-3 py-2 rounded-lg text-xs" placeholder="タスク名" autoFocus />
-                                <div className="flex items-center gap-2">
-                                  <input
-                                    type="number"
-                                    min={1}
-                                    value={inlineTask.point_value}
-                                    onChange={e => setInlineTask(t => ({ ...t, point_value: parseInt(e.target.value) || 1 }))}
-                                    className="input-dark w-20 shrink-0 px-3 py-1.5 rounded-lg text-xs text-center"
-                                  />
-                                  <span className="text-xs text-slate-500 shrink-0">pt</span>
-                                  <div className="flex gap-1 flex-wrap">
-                                    {[1, 2, 3, 5, 10, 20].map(pt => (
-                                      <button key={pt} type="button" onClick={() => setInlineTask(t => ({ ...t, point_value: pt }))}
-                                        className={`px-2 py-1 rounded-lg text-[10px] border transition-colors ${inlineTask.point_value === pt ? 'bg-gold-500/20 border-gold-500/50 text-gold-400 font-bold' : 'border-slate-700 text-slate-400'}`}>
-                                        {pt}
-                                      </button>
-                                    ))}
-                                  </div>
-                                </div>
-                                <div className="flex gap-2">
-                                  <button onClick={() => setShowNewTaskFor(null)} className="flex-1 py-1.5 rounded-lg text-[10px] text-slate-500 border border-slate-700">{T.cancel}</button>
-                                  <button onClick={() => saveInlineTask(date)} disabled={savingInlineTask || !inlineTask.content.trim()}
-                                    className="flex-1 py-1.5 rounded-lg text-[10px] btn-gold font-bold disabled:opacity-40">
-                                    {savingInlineTask ? T.saving : T.createAndSelect}
-                                  </button>
-                                </div>
+                          </div>
+                          {(() => {
+                            const prevWs0 = (() => { const d = new Date(ws0 + 'T00:00:00'); d.setDate(d.getDate() - 7); return d.toISOString().slice(0, 10) })()
+                            const goalVal = weeklyGoalTexts[ws0] !== undefined ? weeklyGoalTexts[ws0] : (weeklyGoalTexts[prevWs0] ?? '')
+                            return <RichEditor value={goalVal} multiline onChange={v => {
+                              setWeeklyGoalTexts(p => ({ ...p, [ws0]: v }))
+                              if (weeklyGoalTimers.current[ws0]) clearTimeout(weeklyGoalTimers.current[ws0])
+                              weeklyGoalTimers.current[ws0] = setTimeout(() => {
+                                fetch(`/api/client/${token}/weekly-goal`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: v, week_start: ws0 }) })
+                              }, 800)
+                            }} className="w-full px-3 py-2 text-xs text-slate-300 min-h-[2.5rem]" placeholder={T.weekGoalPlaceholder} />
+                          })()}
+                          {weekLoading ? (
+                            <div className="py-8 text-center text-slate-600 text-xs">読み込み中...</div>
+                          ) : (
+                            <div className="divide-y divide-slate-800/40">
+                              {wDates.map((date) => {
+                                const dOff = getOffsetForDate(date)
+                                const dow = new Date(date + 'T00:00:00').getDay()
+                                const labelIdx = (dow - weekStartDay + 7) % 7
+                                return renderDayRow(date, labelIdx, dOff === 0 || dOff === null, dOff === null || dOff === 0 ? undefined : dOff)
+                              })}
+                            </div>
+                          )}
+                          <div className="px-3 py-2.5 border-t border-slate-800/40">
+                            <div className="text-[9px] text-slate-500 font-bold uppercase tracking-widest mb-1">{T.memo}</div>
+                            <textarea value={weeklyMemoTexts[ws0] ?? ''} onChange={e => {
+                              const val = e.target.value
+                              setWeeklyMemoTexts(p => ({ ...p, [ws0]: val }))
+                              e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'
+                              if (weeklyMemoTimers.current[ws0]) clearTimeout(weeklyMemoTimers.current[ws0])
+                              weeklyMemoTimers.current[ws0] = setTimeout(() => {
+                                fetch(`/api/client/${token}/weekly-memo`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: val, week_start: ws0 }) })
+                              }, 800)
+                            }} ref={el => { if (el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px' } }}
+                              className="bg-transparent border-none outline-none text-xs text-slate-300 placeholder-slate-700 w-full resize-none overflow-hidden leading-relaxed" placeholder={T.memoPlaceholder} rows={1} />
+                          </div>
+                        </div>
+                        {todayReport && todayReport.result ? (
+                          <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 px-3 py-2.5">
+                            <div className="text-[10px] text-emerald-400 font-bold mb-1">{T.reportSubmitted}</div>
+                            {todayReport.result && <p className="text-xs text-slate-300 line-clamp-2">{todayReport.result}</p>}
+                            {(todayReport.coach_fb || todayReport.coach_ff) && (
+                              <div className="mt-2 pt-2 border-t border-emerald-500/20 space-y-1">
+                                {todayReport.coach_fb && <p className="text-xs text-slate-300"><span className="text-gold-400 font-medium">FB：</span>{todayReport.coach_fb}</p>}
+                                {todayReport.coach_ff && <p className="text-xs text-slate-300"><span className="text-emerald-400 font-medium">FF：</span>{todayReport.coach_ff}</p>}
                               </div>
                             )}
                           </div>
+                        ) : (
+                          <button onClick={() => setTab('report')} className="glass-card w-full rounded-xl px-3 py-2.5 text-left hover:border-gold-500/30 transition-colors">
+                            <div className="text-[10px] text-slate-400 mb-0.5">{T.reportToday}</div>
+                            <div className="text-sm text-gold-400 font-medium">{T.reportPrompt}</div>
+                          </button>
                         )}
+                        {latestFb && (latestFb.coach_fb || latestFb.coach_ff) && latestFb.report_date !== today && (
+                          <div className="glass-card rounded-xl px-3 py-2.5">
+                            <div className="text-[10px] text-slate-400 uppercase tracking-widest mb-1">コーチからのフィードバック <span className="text-slate-600 normal-case">{latestFb.report_date}</span></div>
+                            {latestFb.coach_fb && <p className="text-xs text-slate-300 mb-1"><span className="text-gold-400">FB：</span>{latestFb.coach_fb}</p>}
+                            {latestFb.coach_ff && <p className="text-xs text-slate-300"><span className="text-emerald-400">FF：</span>{latestFb.coach_ff}</p>}
+                          </div>
+                        )}
+                      </Fragment>
+                    )
+                  })()}
+
+                  {/* 月グリッド */}
+                  <div className="glass-card rounded-xl p-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <button onClick={() => setSelectedYear(y => y - 1)} className="text-slate-400 hover:text-white text-sm px-2">◀</button>
+                      <span className="text-xs font-bold text-slate-400">{selectedYear}年</span>
+                      <button onClick={() => setSelectedYear(y => y + 1)} disabled={selectedYear >= currentYear} className="text-slate-400 hover:text-white text-sm px-2 disabled:opacity-30">▶</button>
+                    </div>
+                    <div className="grid grid-cols-6 gap-1.5">
+                      {Array.from({ length: 12 }, (_, i) => i + 1).map(m => {
+                        const yearMonth = `${selectedYear}-${String(m).padStart(2, '0')}`
+                        const isCurrent = yearMonth === currentMonth
+                        const isSelected = viewMonth === yearMonth
+                        const isFuture = yearMonth > currentMonth
+                        const hasData = monthHasData(yearMonth) || isCurrent
+                        return (
+                          <button
+                            key={m}
+                            onClick={() => !isFuture && handleSelectMonth(yearMonth)}
+                            disabled={isFuture}
+                            className={`py-1.5 rounded-lg text-[11px] font-semibold transition-all border ${
+                              isSelected
+                                ? 'bg-gold-400/20 text-gold-400 border-gold-400/40'
+                                : isCurrent
+                                  ? 'text-slate-200 border-slate-600 hover:border-gold-400/40'
+                                  : hasData
+                                    ? 'text-slate-300 border-slate-700 hover:border-slate-500'
+                                    : isFuture
+                                      ? 'text-slate-800 border-slate-800/50 cursor-default'
+                                      : 'text-slate-600 border-slate-800 hover:border-slate-600 hover:text-slate-400'
+                            }`}
+                          >
+                            {m}月
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  {/* 過去月選択時の月次ゴール（月グリッド直下） */}
+                  {selectedHistoryMonth && selectedHistoryMonth !== currentMonth && (() => {
+                    const planDefault = planMonthDefaults[selectedHistoryMonth] || ''
+                    const displayVal = monthlyGoals[selectedHistoryMonth] !== undefined ? monthlyGoals[selectedHistoryMonth] : planDefault
+                    return (
+                      <div className="glass-card rounded-xl overflow-hidden">
+                        <div className="px-3 py-2 border-b border-slate-800/40 flex items-center justify-between">
+                          <span className="text-sm font-bold text-slate-400">
+                            {parseInt(selectedHistoryMonth.split('-')[1])}月（{selectedHistoryMonth.split('-')[0]}年）
+                          </span>
+                          {loadingMore && <span className="text-[10px] text-slate-600">読み込み中...</span>}
+                        </div>
+                        <div className="px-3 py-2">
+                          <RichEditor
+                            key={`${selectedHistoryMonth}-${planDefault ? 'plan' : 'db'}`}
+                            value={displayVal}
+                            onChange={v => {
+                              setMonthlyGoals(p => ({ ...p, [selectedHistoryMonth]: v }))
+                              if (monthlyGoalTimers.current[selectedHistoryMonth]) clearTimeout(monthlyGoalTimers.current[selectedHistoryMonth])
+                              monthlyGoalTimers.current[selectedHistoryMonth] = setTimeout(() => {
+                                fetch(`/api/client/${token}/monthly-goal`, {
+                                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ content: v, period_label: selectedHistoryMonth }),
+                                })
+                              }, 800)
+                            }}
+                            placeholder="達成すること..."
+                            className="text-base text-slate-100 w-full leading-relaxed font-medium"
+                            multiline
+                          />
+                        </div>
                       </div>
                     )
-                  })}
-                </div>
-              )}
-            </div>
+                  })()}
 
-            {/* 今週のメモ */}
-            <div className="glass-card rounded-xl px-3 py-2.5">
-              <div className="text-[9px] text-slate-500 font-bold uppercase tracking-widest mb-1">
-                {T.memo}
-              </div>
-              <textarea
-                value={weeklyMemoText}
-                onChange={e => {
-                  const val = e.target.value
-                  setWeeklyMemoText(val)
-                  e.target.style.height = 'auto'
-                  e.target.style.height = e.target.scrollHeight + 'px'
-                  if (weeklyMemoTimer.current) clearTimeout(weeklyMemoTimer.current)
-                  weeklyMemoTimer.current = setTimeout(() => {
-                    fetch(`/api/client/${token}/weekly-memo`, {
-                      method: 'POST', headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ content: val, week_start: weekStart }),
-                    }).then(async () => {
-                      // client_goalsキャッシュを更新して週切り替え時に反映
-                      setData(prev => {
-                        if (!prev) return prev
-                        const exists = (prev.client_goals as any[]).some(g => g.goal_type === 'weekly_memo' && g.period_label === weekStart)
-                        const updated = exists
-                          ? prev.client_goals.map((g: any) => g.goal_type === 'weekly_memo' && g.period_label === weekStart ? { ...g, content: val } : g)
-                          : [...prev.client_goals, { id: 'wm_' + weekStart, client_id: prev.id ?? '', goal_type: 'weekly_memo', period_label: weekStart, content: val, point_value: 0 }]
-                        return { ...prev, client_goals: updated }
-                      })
+                  {/* カレンダー週（1-7, 8-14, 15-21, 22-末日） */}
+                  {(() => {
+                    const lastDayNum = parseInt(lastDayOfViewMonth.slice(8, 10))
+                    const calWeekDefs = [[1,7],[8,14],[15,21],[22,lastDayNum]]
+                    return calWeekDefs.map(([startD, endD], weekIdx) => {
+                      const weekNum = weekIdx + 1
+                      const wDates: string[] = []
+                      for (let d = startD; d <= endD; d++) {
+                        wDates.push(viewMonth + '-' + String(d).padStart(2, '0'))
+                      }
+                      const collapseKey = -(weekIdx + 1) * 1000
+                      const isWeekCollapsed = collapsedWeeks.has(collapseKey)
+
+                      // 週次ゴール・メモ用ws：ブロックの最終日を基準に解決（最終日は隣ブロックと7日ずれるため衝突しない）
+                      const primaryWs = (() => {
+                        const refDate = wDates[wDates.length - 1]
+                        if (data?.week_start && getWeekDates(data.week_start).includes(refDate)) return data.week_start
+                        for (const wk of Object.values(weekDataCache.current)) {
+                          if (getWeekDates(wk.week_start).includes(refDate)) return wk.week_start
+                        }
+                        return refDate
+                      })()
+
+                      const weekPts = wDates.reduce((sum, date) => {
+                        const dOff = getOffsetForDate(date)
+                        const _s = dOff === null ? {} : (dOff === 0 ? slots : (slotsCache.current[dOff] ?? {}))
+                        const _c = dOff === null ? {} : (dOff === 0 ? completions : (completionsCache.current[dOff] ?? {}))
+                        return sum + (_s[date] ?? []).filter(sl => _c[ck(sl.id, date)]).reduce((ps, sl) => ps + sl.point_value, 0)
+                      }, 0)
+
+                      const d0 = new Date(wDates[0]); const dN = new Date(wDates[wDates.length - 1])
+                      const rangeLabel = `${d0.getMonth()+1}/${d0.getDate()} – ${dN.getMonth()+1}/${dN.getDate()}`
+
+                      return (
+                        <Fragment key={`${viewMonth}-W${weekNum}`}>
+                          <div className="glass-card rounded-2xl">
+                            <div className="flex items-center justify-between px-3 pt-3 pb-2 border-b border-slate-800/60">
+                              <button className="flex-1 text-left" onClick={() => setCollapsedWeeks(cw => { const n = new Set(cw); isWeekCollapsed ? n.delete(collapseKey) : n.add(collapseKey); return n })}>
+                                <div className="text-xs font-bold text-slate-400">第{weekNum}週</div>
+                                <div className="text-[9px] text-slate-600">{rangeLabel}</div>
+                              </button>
+                              <button onClick={() => setCollapsedWeeks(cw => { const n = new Set(cw); isWeekCollapsed ? n.delete(collapseKey) : n.add(collapseKey); return n })} className="text-[10px] text-slate-500 hover:text-slate-300 px-2 py-1 rounded transition-colors flex items-center gap-1">
+                                <span>{isWeekCollapsed ? '▾' : '▴'}</span><span>{isWeekCollapsed ? '開く' : 'たたむ'}</span>
+                              </button>
+                              {weekPts > 0 && <span className="text-xs text-gold-400 font-semibold ml-2">+{weekPts}pt</span>}
+                            </div>
+
+                            {!isWeekCollapsed && <RichEditor
+                              value={weeklyGoalTexts[primaryWs] ?? ''}
+                              multiline
+                              onChange={v => {
+                                setWeeklyGoalTexts(p => ({ ...p, [primaryWs]: v }))
+                                if (weeklyGoalTimers.current[primaryWs]) clearTimeout(weeklyGoalTimers.current[primaryWs])
+                                weeklyGoalTimers.current[primaryWs] = setTimeout(() => {
+                                  fetch(`/api/client/${token}/weekly-goal`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: v, week_start: primaryWs }) })
+                                }, 800)
+                              }}
+                              className="w-full px-3 py-2 text-xs text-slate-300 min-h-[2.5rem]"
+                              placeholder={T.weekGoalPlaceholder}
+                            />}
+
+                            {!isWeekCollapsed && (
+                              <div className="divide-y divide-slate-800/40">
+                                {wDates.map((date) => {
+                                  const dOff = getOffsetForDate(date)
+                                  const dow = new Date(date + 'T00:00:00').getDay()
+                                  const labelIdx = (dow - weekStartDay + 7) % 7
+                                  return renderDayRow(date, labelIdx, false, dOff === null || dOff === 0 ? undefined : dOff)
+                                })}
+                              </div>
+                            )}
+
+                            {!isWeekCollapsed && <div className="px-3 py-2.5 border-t border-slate-800/40">
+                              <div className="text-[9px] text-slate-500 font-bold uppercase tracking-widest mb-1">{T.memo}</div>
+                              <textarea
+                                value={weeklyMemoTexts[primaryWs] ?? ''}
+                                onChange={e => {
+                                  const val = e.target.value
+                                  setWeeklyMemoTexts(p => ({ ...p, [primaryWs]: val }))
+                                  e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'
+                                  if (weeklyMemoTimers.current[primaryWs]) clearTimeout(weeklyMemoTimers.current[primaryWs])
+                                  weeklyMemoTimers.current[primaryWs] = setTimeout(() => {
+                                    fetch(`/api/client/${token}/weekly-memo`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: val, week_start: primaryWs }) })
+                                  }, 800)
+                                }}
+                                ref={el => { if (el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px' } }}
+                                className="bg-transparent border-none outline-none text-xs text-slate-300 placeholder-slate-700 w-full resize-none overflow-hidden leading-relaxed"
+                                placeholder={T.memoPlaceholder} rows={1}
+                              />
+                            </div>}
+                          </div>
+                        </Fragment>
+                      )
                     })
-                  }, 800)
-                }}
-                ref={el => { if (el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px' } }}
-                className="bg-transparent border-none outline-none text-xs text-slate-300 placeholder-slate-700 w-full resize-none overflow-hidden leading-relaxed"
-                placeholder={T.memoPlaceholder}
-                rows={2}
-              />
-            </div>
-
-            {todayReport && todayReport.result ? (
-              <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 px-3 py-2.5">
-                <div className="text-[10px] text-emerald-400 font-bold mb-1">{T.reportSubmitted}</div>
-                {todayReport.result && <p className="text-xs text-slate-300 line-clamp-2">{todayReport.result}</p>}
-                {(todayReport.coach_fb || todayReport.coach_ff) && (
-                  <div className="mt-2 pt-2 border-t border-emerald-500/20 space-y-1">
-                    {todayReport.coach_fb && <p className="text-xs text-slate-300"><span className="text-gold-400 font-medium">FB：</span>{todayReport.coach_fb}</p>}
-                    {todayReport.coach_ff && <p className="text-xs text-slate-300"><span className="text-emerald-400 font-medium">FF：</span>{todayReport.coach_ff}</p>}
-                  </div>
-                )}
-              </div>
-            ) : (
-              <button onClick={() => setTab('report')} className="glass-card w-full rounded-xl px-3 py-2.5 text-left hover:border-gold-500/30 transition-colors">
-                <div className="text-[10px] text-slate-400 mb-0.5">{T.reportToday}</div>
-                <div className="text-sm text-gold-400 font-medium">{T.reportPrompt}</div>
-              </button>
-            )}
-
-            {latestFb && (latestFb.coach_fb || latestFb.coach_ff) && latestFb.report_date !== today && (
-              <div className="glass-card rounded-xl px-3 py-2.5">
-                <div className="text-[10px] text-slate-400 uppercase tracking-widest mb-1">コーチからのフィードバック <span className="text-slate-600 normal-case">{latestFb.report_date}</span></div>
-                {latestFb.coach_fb && <p className="text-xs text-slate-300 mb-1"><span className="text-gold-400">FB：</span>{latestFb.coach_fb}</p>}
-                {latestFb.coach_ff && <p className="text-xs text-slate-300"><span className="text-emerald-400">FF：</span>{latestFb.coach_ff}</p>}
-              </div>
-            )}
+                  })()}
+                  </>
+                )
+        })()}
           </>
         )}
 
@@ -2481,6 +3134,7 @@ export default function ClientPortal() {
             </div>
             <form onSubmit={submitReport} className="space-y-3">
               <div className="glass-card rounded-2xl p-4 space-y-4">
+                {/* DATE */}
                 <div>
                   <label className="flex items-baseline gap-1.5 mb-1.5">
                     <span className="text-[10px] font-bold text-gold-400/80 uppercase tracking-widest">DATE</span>
@@ -2488,46 +3142,64 @@ export default function ClientPortal() {
                   </label>
                   <input type="date" value={reportForm.report_date} onChange={e => setReportForm(f => ({ ...f, report_date: e.target.value }))} className="input-dark px-4 py-3 rounded-xl text-sm w-full" />
                 </div>
+
+                {/* GOAL（HTML訂正線対応） */}
                 <div>
                   <label className="flex items-baseline gap-1.5 mb-1.5">
                     <span className="text-[10px] font-bold text-gold-400/80 uppercase tracking-widest">GOAL</span>
                     <span className="text-[9px] text-slate-600">{T.todayGoalLabel}</span>
                   </label>
-                  <textarea value={reportForm.today_goal} onChange={e => setReportForm(f => ({ ...f, today_goal: e.target.value }))} className="input-dark w-full px-4 py-3 rounded-xl text-sm" rows={2} placeholder={T.todayGoalFormPlaceholder} />
+                  <textarea
+                    value={reportForm.today_goal}
+                    onChange={e => setReportForm(f => ({ ...f, today_goal: e.target.value }))}
+                    className="input-dark w-full px-4 py-3 rounded-xl text-sm min-h-[3rem]"
+                    placeholder={T.todayGoalFormPlaceholder}
+                    rows={2}
+                  />
                 </div>
+
+                {/* SCORE 10点満点 */}
+                <div>
+                  <label className="flex items-baseline gap-1.5 mb-2">
+                    <span className="text-[10px] font-bold text-gold-400/80 uppercase tracking-widest">SCORE</span>
+                    <span className="text-[9px] text-slate-600">{lang === 'en' ? '10-point scale' : '10点満点'}</span>
+                    {reportForm.score !== null && (
+                      <span className="ml-auto text-[10px] text-gold-400 font-bold">
+                        +{reportForm.score === 10 ? 20 : reportForm.score}pt
+                      </span>
+                    )}
+                  </label>
+                  <div className="flex gap-1.5 flex-wrap">
+                    {[1,2,3,4,5,6,7,8,9,10].map(n => (
+                      <button key={n} type="button"
+                        onClick={() => setReportForm(f => ({ ...f, score: f.score === n ? null : n }))}
+                        className={`flex-1 min-w-[2rem] py-2 rounded-lg text-sm font-bold border transition-colors ${
+                          reportForm.score === n
+                            ? n === 10 ? 'bg-gold-500/30 border-gold-400/70 text-gold-300'
+                              : n >= 7 ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300'
+                              : 'bg-red-500/20 border-red-500/50 text-red-300'
+                            : 'border-slate-700 text-slate-500 hover:border-slate-500'
+                        }`}>{n}</button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 原因と改善 */}
                 <div>
                   <label className="flex items-baseline gap-1.5 mb-1.5">
-                    <span className="text-[10px] font-bold text-gold-400/80 uppercase tracking-widest">RESULT</span>
-                    <span className="text-[9px] text-slate-600">{T.resultLabel}</span>
+                    <span className="text-[10px] font-bold text-gold-400/80 uppercase tracking-widest">CAUSE & IMPROVE</span>
+                    <span className="text-[9px] text-slate-600">{lang === 'en' ? 'Cause & improvement' : '原因と改善'}</span>
                   </label>
-                  <textarea value={reportForm.result} onChange={e => setReportForm(f => ({ ...f, result: e.target.value }))} className="input-dark w-full px-4 py-3 rounded-xl text-sm" rows={4} placeholder={T.resultPlaceholder} />
+                  <textarea value={reportForm.reason} onChange={e => setReportForm(f => ({ ...f, reason: e.target.value }))} className="input-dark w-full px-4 py-3 rounded-xl text-sm" rows={3} placeholder={lang === 'en' ? 'Cause of miss & how to improve...' : '未達の原因・改善策...'} />
                 </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <button type="button" onClick={() => setReportForm(f => ({ ...f, achieved: true }))} className={`py-3 rounded-xl text-sm border font-medium transition-colors ${reportForm.achieved === true ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400' : 'border-slate-700 text-slate-500'}`}>✓ ACHIEVED</button>
-                  <button type="button" onClick={() => setReportForm(f => ({ ...f, achieved: false }))} className={`py-3 rounded-xl text-sm border font-medium transition-colors ${reportForm.achieved === false ? 'bg-red-500/20 border-red-500/50 text-red-400' : 'border-slate-700 text-slate-500'}`}>✗ MISSED</button>
-                </div>
-                {reportForm.achieved === false && (
-                  <div>
-                    <label className="flex items-baseline gap-1.5 mb-1.5">
-                      <span className="text-[10px] font-bold text-gold-400/80 uppercase tracking-widest">CAUSE</span>
-                      <span className="text-[9px] text-slate-600">{T.causeLabel}</span>
-                    </label>
-                    <textarea value={reportForm.reason} onChange={e => setReportForm(f => ({ ...f, reason: e.target.value }))} className="input-dark w-full px-4 py-3 rounded-xl text-sm" rows={3} placeholder={T.causePlaceholder} />
-                  </div>
-                )}
+
+                {/* NEXT GOAL */}
                 <div>
                   <label className="flex items-baseline gap-1.5 mb-1.5">
                     <span className="text-[10px] font-bold text-gold-400/80 uppercase tracking-widest">NEXT GOAL</span>
                     <span className="text-[9px] text-slate-600">{T.tomorrowGoalLabel}</span>
                   </label>
                   <textarea value={reportForm.tomorrow_goal} onChange={e => setReportForm(f => ({ ...f, tomorrow_goal: e.target.value }))} className="input-dark w-full px-4 py-3 rounded-xl text-sm" rows={2} placeholder={T.tomorrowPlaceholder} />
-                </div>
-                <div>
-                  <label className="flex items-baseline gap-1.5 mb-1.5">
-                    <span className="text-[10px] font-bold text-gold-400/80 uppercase tracking-widest">IMPROVEMENT</span>
-                    <span className="text-[9px] text-slate-600">{T.improvementLabel}</span>
-                  </label>
-                  <textarea value={reportForm.memo} onChange={e => setReportForm(f => ({ ...f, memo: e.target.value }))} className="input-dark w-full px-4 py-3 rounded-xl text-sm" rows={2} placeholder={T.improvementPlaceholder} />
                 </div>
               </div>
               <button type="submit" disabled={submitting} className="btn-gold w-full py-4 rounded-xl text-sm font-semibold disabled:opacity-50">
@@ -2553,13 +3225,6 @@ export default function ClientPortal() {
         )}
 
         {/* ======= HISTORY ======= */}
-        {tab === 'history' && (
-          <HistoryTab
-            lang={lang} token={token} dailyReports={data.daily_reports}
-            onMapRestored={() => setMapRefreshKey(k => k + 1)}
-            T={T}
-          />
-        )}
       </main>
 
       <nav className="fixed bottom-0 left-0 right-0 border-t theme-border-nav theme-bg-header backdrop-blur-md z-50">

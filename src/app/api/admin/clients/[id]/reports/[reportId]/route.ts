@@ -5,10 +5,15 @@ import { getLevelFromScore } from '@/lib/level-system'
 export async function PATCH(req: NextRequest, { params }: { params: { id: string; reportId: string } }) {
   const pool = getPool()
   const body = await req.json()
-  await pool.query(
-    'UPDATE daily_reports SET coach_fb = $1, coach_ff = $2, score = $3 WHERE id = $4 AND client_id = $5',
-    [body.coach_fb ?? null, body.coach_ff ?? null, body.score ?? 0, params.reportId, params.id]
-  )
+  const fields: string[] = []
+  const vals: unknown[] = []
+  let i = 1
+  for (const col of ['coach_fb','coach_ff','score','today_goal','tomorrow_goal','result','achieved','reason','memo','slots'] as const) {
+    if (col in body) { fields.push(`${col} = $${i++}`); vals.push(body[col]) }
+  }
+  if (fields.length === 0) return NextResponse.json({ error: 'no fields' }, { status: 400 })
+  vals.push(params.reportId, params.id)
+  await pool.query(`UPDATE daily_reports SET ${fields.join(', ')} WHERE id = $${i++} AND client_id = $${i}`, vals)
   if (body.score !== undefined) {
     const { rows: [rep] } = await pool.query('SELECT COALESCE(SUM(score),0) as s FROM daily_reports WHERE client_id = $1', [params.id])
     const { rows: completions } = await pool.query('SELECT task_id FROM daily_completions WHERE client_id = $1 AND completed = 1', [params.id])

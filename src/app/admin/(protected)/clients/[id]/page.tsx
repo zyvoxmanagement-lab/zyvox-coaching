@@ -16,6 +16,7 @@ type ClientDetail = Client & {
   monthly_meetings: MonthlyMeeting[]
   weekly_completions: { task_id: string; completion_date: string; completed: boolean }[]
   week_start: string
+  coaching_start_date?: string | null
 }
 
 const IDEAL_MAP_FIELDS = [
@@ -56,7 +57,7 @@ export default function ClientDetailPage() {
   const [expandedDay, setExpandedDay] = useState<string | null>(null)
 
   // 顧客情報
-  const [infoForm, setInfoForm] = useState({ real_name: '', instagram_name: '', phone: '', email: '', note: '', memo: '' })
+  const [infoForm, setInfoForm] = useState({ real_name: '', instagram_name: '', phone: '', email: '', note: '', memo: '', coaching_start_date: '' })
   const [savingInfo, setSavingInfo] = useState(false)
 
   // Ideal map edit state
@@ -83,6 +84,7 @@ export default function ClientDetailPage() {
       email: data.email ?? '',
       note: data.note ?? '',
       memo: data.memo ?? '',
+      coaching_start_date: data.coaching_start_date ? data.coaching_start_date.split('T')[0] : '',
     })
     const im = data.ideal_maps
     if (im) {
@@ -310,8 +312,18 @@ export default function ClientDetailPage() {
             </div>
             <div className="glass-card rounded-xl p-4">
               <div className="text-xs text-slate-400 mb-1">日報数</div>
-              <div className="text-2xl font-bold text-white">{client.daily_reports.length}</div>
-              <div className="text-xs text-slate-500">件</div>
+              {(() => {
+                const startDate = client.coaching_start_date ? client.coaching_start_date.split('T')[0] : null
+                if (!startDate) return <><div className="text-2xl font-bold text-white">{client.daily_reports.length}</div><div className="text-xs text-slate-500">件</div></>
+                const start = new Date(startDate)
+                const todayDate = new Date(today)
+                const totalDays = Math.floor((todayDate.getTime() - start.getTime()) / 86400000) + 1
+                const submittedDays = client.daily_reports.filter(r => r.report_date >= startDate).length
+                return <>
+                  <div className="text-2xl font-bold text-white">{submittedDays}<span className="text-base text-slate-400">/{totalDays}</span></div>
+                  <div className="text-xs text-slate-500">日</div>
+                </>
+              })()}
             </div>
             <div className="glass-card rounded-xl p-4 col-span-2 sm:col-span-1">
               <div className="text-xs text-slate-400 mb-1">登録日</div>
@@ -326,7 +338,7 @@ export default function ClientDetailPage() {
             {weeklyGoalContent && (
               <div className="glass-card rounded-xl p-4 border-l-2 border-gold-500/40">
                 <div className="text-xs text-slate-400 mb-1">今週のゴール</div>
-                <p className="text-sm text-white">{weeklyGoalContent}</p>
+                <p className="text-sm text-white" dangerouslySetInnerHTML={{ __html: weeklyGoalContent }} />
               </div>
             )}
             {reportByDate[today]?.today_goal && (
@@ -414,11 +426,15 @@ export default function ClientDetailPage() {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="glass-card rounded-xl p-4">
               <div className="text-xs text-slate-400 mb-1">今週のゴール</div>
-              <p className="text-sm text-white">{weeklyGoalContent || <span className="text-slate-500">未設定</span>}</p>
+              {weeklyGoalContent
+                ? <p className="text-sm text-white" dangerouslySetInnerHTML={{ __html: weeklyGoalContent }} />
+                : <span className="text-slate-500 text-sm">未設定</span>}
             </div>
             <div className="glass-card rounded-xl p-4">
               <div className="text-xs text-slate-400 mb-1">今月のゴール</div>
-              <p className="text-sm text-white">{monthlyGoalContent || <span className="text-slate-500">未設定</span>}</p>
+              {monthlyGoalContent
+                ? <p className="text-sm text-white" dangerouslySetInnerHTML={{ __html: monthlyGoalContent }} />
+                : <span className="text-slate-500 text-sm">未設定</span>}
             </div>
           </div>
 
@@ -591,6 +607,15 @@ export default function ClientDetailPage() {
                   placeholder="090-0000-0000"
                 />
               </div>
+            </div>
+            <div>
+              <label className="block text-xs text-slate-400 mb-1.5 uppercase tracking-wider">コーチング開始日</label>
+              <input
+                type="date"
+                value={infoForm.coaching_start_date}
+                onChange={e => setInfoForm(f => ({ ...f, coaching_start_date: e.target.value }))}
+                className="input-dark w-full px-4 py-2.5 rounded-xl text-sm"
+              />
             </div>
             <div>
               <label className="block text-xs text-slate-400 mb-1.5 uppercase tracking-wider">管理メモ（外部非公開）</label>

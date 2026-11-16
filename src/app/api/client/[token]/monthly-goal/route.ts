@@ -6,6 +6,16 @@ export async function POST(req: NextRequest, { params }: { params: { token: stri
   const { rows: [client] } = await pool.query('SELECT id FROM clients WHERE access_token = $1', [params.token])
   if (!client) return NextResponse.json({ error: 'Not found' }, { status: 404 })
   const { content, period_label } = await req.json()
+  const { rows: [existing] } = await pool.query(
+    "SELECT content FROM client_goals WHERE client_id=$1 AND goal_type='monthly' AND period_label=$2",
+    [client.id, period_label]
+  )
+  if (existing?.content && existing.content !== content) {
+    await pool.query(
+      "INSERT INTO goal_history (id,client_id,goal_type,period_label,content) VALUES ($1,$2,'monthly',$3,$4)",
+      [genId(), client.id, period_label, existing.content]
+    ).catch(() => {})
+  }
   await pool.query(
     `INSERT INTO client_goals (id,client_id,goal_type,period_label,content,point_value) VALUES ($1,$2,'monthly',$3,$4,0)
      ON CONFLICT DO NOTHING`,

@@ -96,6 +96,7 @@
 
 * {
   box-sizing: border-box;
+  touch-action: manipulation;
 }
 
 body {
@@ -103,6 +104,25 @@ body {
   color: #e2e8f0;
   font-family: 'Inter', 'Hiragino Kaku Gothic ProN', sans-serif;
 }
+
+/* ライトテーマ：Tailwindの固定色クラスを上書き */
+[data-theme="light"] .text-white,
+[data-theme="light"] .text-slate-100,
+[data-theme="light"] .text-slate-200 { color: #1e293b !important; }
+[data-theme="light"] .text-slate-300 { color: #334155 !important; }
+[data-theme="light"] .text-slate-400 { color: #475569 !important; }
+[data-theme="light"] .text-slate-500 { color: #64748b !important; }
+[data-theme="light"] .text-slate-600 { color: #94a3b8 !important; }
+[data-theme="light"] .text-slate-700 { color: #cbd5e1 !important; }
+[data-theme="light"] .bg-slate-800\/20,
+[data-theme="light"] .bg-slate-800\/30,
+[data-theme="light"] .bg-slate-800\/40 { background-color: rgba(0,0,0,0.06) !important; }
+[data-theme="light"] .bg-slate-900\/95 { background-color: rgba(255,255,255,0.96) !important; }
+[data-theme="light"] .border-slate-600\/80,
+[data-theme="light"] .border-slate-700\/60,
+[data-theme="light"] .border-slate-800\/40,
+[data-theme="light"] .border-slate-800\/60 { border-color: rgba(0,0,0,0.12) !important; }
+[data-theme="light"] .placeholder-slate-700::placeholder { color: #94a3b8 !important; }
 
 .theme-bg {
   background-color: var(--bg-base) !important;
@@ -238,3 +258,16 @@ textarea.input-dark {
   background-size: 200% 100%;
   animation: shimmer 2s infinite;
 }
+
+[contenteditable][data-placeholder]:empty::before {
+  content: attr(data-placeholder);
+  color: #334155;
+  pointer-events: none;
+}
+[contenteditable] s,
+[contenteditable] strike { text-decoration: line-through; }
+[contenteditable].line-through {
+  text-decoration: line-through !important;
+  -webkit-text-decoration-line: line-through !important;
+}
+

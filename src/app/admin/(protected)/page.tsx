@@ -1,23 +1,18 @@
-import { supabase } from '@/lib/supabase'
+import { getPool } from '@/lib/pg-pool'
 import Link from 'next/link'
 import LevelBadge from '@/components/LevelBadge'
 
 export const dynamic = 'force-dynamic'
 
 export default async function AdminDashboard() {
-  const { data: clients } = await supabase
-    .from('clients')
-    .select('id, name, email, total_score, current_level, created_at')
-    .order('total_score', { ascending: false })
-    .limit(5)
-
-  const { count: totalClients } = await supabase.from('clients').select('*', { count: 'exact', head: true })
-
+  const pool = getPool()
   const today = new Date().toISOString().split('T')[0]
-  const { count: todayReports } = await supabase
-    .from('daily_reports')
-    .select('*', { count: 'exact', head: true })
-    .eq('report_date', today)
+
+  const [{ rows: clients }, { rows: [{ count: totalClients }] }, { rows: [{ count: todayReports }] }] = await Promise.all([
+    pool.query('SELECT id, name, email, total_score, current_level, created_at FROM clients ORDER BY total_score DESC LIMIT 5'),
+    pool.query('SELECT COUNT(*) as count FROM clients'),
+    pool.query('SELECT COUNT(*) as count FROM daily_reports WHERE report_date = $1', [today]),
+  ])
 
   return (
     <div className="space-y-8">
