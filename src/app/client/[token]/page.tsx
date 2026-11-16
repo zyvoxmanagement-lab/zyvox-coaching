@@ -3037,22 +3037,18 @@ export default function ClientPortal() {
                       const collapseKey = -(weekIdx + 1) * 1000
                       const isWeekCollapsed = collapsedWeeks.has(collapseKey)
 
-                      // 今週と重複するブロックは過去カレンダーに不要なので非表示
+                      // 今週と過半数の日が重複するブロックは非表示（今週カードで扱う）
                       const currentWeekDates = data?.week_start ? getWeekDates(data.week_start) : []
-                      const isCurrentWeekBlock = wDates.some(d => currentWeekDates.includes(d))
+                      const overlapCount = wDates.filter(d => currentWeekDates.includes(d)).length
+                      const isCurrentWeekBlock = overlapCount > wDates.length / 2
                       if (isCurrentWeekBlock) return null
 
-                      // 週次ゴール・メモ用ws：各日のweek_startを数学計算し多数決（キャッシュ不要・衝突なし）
+                      // 週次ゴール・メモ用ws：初日のweek_startを数学計算（キャッシュ不要・確定的）
                       const primaryWs = (() => {
-                        const wsCount: Record<string, number> = {}
-                        for (const date of wDates) {
-                          const d = new Date(date + 'T00:00:00')
-                          const diff = (d.getDay() - weekStartDay + 7) % 7
-                          d.setDate(d.getDate() - diff)
-                          const ws = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
-                          wsCount[ws] = (wsCount[ws] ?? 0) + 1
-                        }
-                        return Object.entries(wsCount).sort((a, b) => b[1] - a[1])[0]?.[0] ?? wDates[0]
+                        const d = new Date(wDates[0] + 'T00:00:00')
+                        const diff = (d.getDay() - weekStartDay + 7) % 7
+                        d.setDate(d.getDate() - diff)
+                        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
                       })()
 
                       const weekPts = wDates.reduce((sum, date) => {
