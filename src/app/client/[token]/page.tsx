@@ -3037,13 +3037,13 @@ export default function ClientPortal() {
                       const collapseKey = -(weekIdx + 1) * 1000
                       const isWeekCollapsed = collapsedWeeks.has(collapseKey)
 
-                      // 今週と重複するブロックか判定（今週カードと同じキーになるため編集不可にする）
+                      // 今週と重複するブロックは過去カレンダーに不要なので非表示
                       const currentWeekDates = data?.week_start ? getWeekDates(data.week_start) : []
                       const isCurrentWeekBlock = wDates.some(d => currentWeekDates.includes(d))
+                      if (isCurrentWeekBlock) return null
 
                       // 週次ゴール・メモ用ws：初日を基準に解決
                       const primaryWs = (() => {
-                        if (isCurrentWeekBlock) return data?.week_start ?? wDates[0]
                         const refDate = wDates[0]
                         if (data?.week_start && getWeekDates(data.week_start).includes(refDate)) return data.week_start
                         for (const wk of Object.values(weekDataCache.current)) {
@@ -3076,7 +3076,7 @@ export default function ClientPortal() {
                               {weekPts > 0 && <span className="text-xs text-gold-400 font-semibold ml-2">+{weekPts}pt</span>}
                             </div>
 
-                            {!isWeekCollapsed && !isCurrentWeekBlock && <RichEditor
+                            {!isWeekCollapsed && <RichEditor
                               value={weeklyGoalTexts[primaryWs] ?? ''}
                               multiline
                               onChange={v => {
@@ -3101,7 +3101,7 @@ export default function ClientPortal() {
                               </div>
                             )}
 
-                            {!isWeekCollapsed && !isCurrentWeekBlock && <div className="px-3 py-2.5 border-t border-slate-800/40">
+                            {!isWeekCollapsed && <div className="px-3 py-2.5 border-t border-slate-800/40">
                               <div className="text-[9px] text-slate-500 font-bold uppercase tracking-widest mb-1">{T.memo}</div>
                               <textarea
                                 value={weeklyMemoTexts[primaryWs] ?? ''}
