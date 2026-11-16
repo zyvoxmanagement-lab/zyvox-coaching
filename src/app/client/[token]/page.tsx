@@ -3037,9 +3037,14 @@ export default function ClientPortal() {
                       const collapseKey = -(weekIdx + 1) * 1000
                       const isWeekCollapsed = collapsedWeeks.has(collapseKey)
 
-                      // 週次ゴール・メモ用ws：ブロックの最終日を基準に解決（最終日は隣ブロックと7日ずれるため衝突しない）
+                      // 今週と重複するブロックか判定（今週カードと同じキーになるため編集不可にする）
+                      const currentWeekDates = data?.week_start ? getWeekDates(data.week_start) : []
+                      const isCurrentWeekBlock = wDates.some(d => currentWeekDates.includes(d))
+
+                      // 週次ゴール・メモ用ws：初日を基準に解決
                       const primaryWs = (() => {
-                        const refDate = wDates[wDates.length - 1]
+                        if (isCurrentWeekBlock) return data?.week_start ?? wDates[0]
+                        const refDate = wDates[0]
                         if (data?.week_start && getWeekDates(data.week_start).includes(refDate)) return data.week_start
                         for (const wk of Object.values(weekDataCache.current)) {
                           if (getWeekDates(wk.week_start).includes(refDate)) return wk.week_start
@@ -3071,7 +3076,7 @@ export default function ClientPortal() {
                               {weekPts > 0 && <span className="text-xs text-gold-400 font-semibold ml-2">+{weekPts}pt</span>}
                             </div>
 
-                            {!isWeekCollapsed && <RichEditor
+                            {!isWeekCollapsed && !isCurrentWeekBlock && <RichEditor
                               value={weeklyGoalTexts[primaryWs] ?? ''}
                               multiline
                               onChange={v => {
@@ -3096,7 +3101,7 @@ export default function ClientPortal() {
                               </div>
                             )}
 
-                            {!isWeekCollapsed && <div className="px-3 py-2.5 border-t border-slate-800/40">
+                            {!isWeekCollapsed && !isCurrentWeekBlock && <div className="px-3 py-2.5 border-t border-slate-800/40">
                               <div className="text-[9px] text-slate-500 font-bold uppercase tracking-widest mb-1">{T.memo}</div>
                               <textarea
                                 value={weeklyMemoTexts[primaryWs] ?? ''}
