@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getPool } from '@/lib/pg-pool'
-import { cookies } from 'next/headers'
 
 export async function POST(req: NextRequest) {
-  const c = await cookies()
-  if (c.get('admin_auth')?.value !== 'ok') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const { password } = await req.json().catch(() => ({}))
+  if (password !== (process.env.ADMIN_PASSWORD ?? 'zyvox2024')) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const pool = getPool()
   await pool.query(`
     CREATE TABLE IF NOT EXISTS goal_history (
