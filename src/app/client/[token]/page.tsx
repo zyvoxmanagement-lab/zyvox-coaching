@@ -3042,14 +3042,24 @@ export default function ClientPortal() {
                       const isCurrentWeekBlock = wDates.some(d => currentWeekDates.includes(d))
                       if (isCurrentWeekBlock) return null
 
-                      // 週次ゴール・メモ用ws：初日を基準に解決
+                      // 週次ゴール・メモ用ws：ブロック内の日付が最も多く属するweek_startを使う（多数決）
                       const primaryWs = (() => {
-                        const refDate = wDates[0]
-                        if (data?.week_start && getWeekDates(data.week_start).includes(refDate)) return data.week_start
-                        for (const wk of Object.values(weekDataCache.current)) {
-                          if (getWeekDates(wk.week_start).includes(refDate)) return wk.week_start
+                        const wsCount: Record<string, number> = {}
+                        for (const date of wDates) {
+                          let matched = false
+                          if (data?.week_start && getWeekDates(data.week_start).includes(date)) {
+                            wsCount[data.week_start] = (wsCount[data.week_start] ?? 0) + 1; matched = true
+                          }
+                          if (!matched) {
+                            for (const wk of Object.values(weekDataCache.current)) {
+                              if (getWeekDates(wk.week_start).includes(date)) {
+                                wsCount[wk.week_start] = (wsCount[wk.week_start] ?? 0) + 1; matched = true; break
+                              }
+                            }
+                          }
+                          if (!matched) wsCount[date] = (wsCount[date] ?? 0) + 1
                         }
-                        return refDate
+                        return Object.entries(wsCount).sort((a, b) => b[1] - a[1])[0]?.[0] ?? wDates[0]
                       })()
 
                       const weekPts = wDates.reduce((sum, date) => {
